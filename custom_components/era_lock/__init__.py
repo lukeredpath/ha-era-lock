@@ -13,6 +13,7 @@ from .const import CONF_ERA, CONF_SECRETS, CONF_SERVICE_CONFIG, CONF_SESSION, PL
 from .coordinator import EraLockCoordinator
 from .eralock.secrets import DEFAULTS
 from .eralock.session import Session
+from .mqtt_listener import EraMqttListener
 from .session import EraSessionManager
 
 type EraConfigEntry = ConfigEntry[EraLockCoordinator]
@@ -35,9 +36,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: EraConfigEntry) -> bool:
     entry.runtime_data = coordinator
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Start the persistent cloud-MQTT listener (push state + unlock events).
+    listener = EraMqttListener(hass, mgr, combined, entry.entry_id)
+    coordinator.listener = listener
+    await hass.async_add_executor_job(listener.start)
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: EraConfigEntry) -> bool:
     """Unload a config entry."""
+    listener = entry.runtime_data.listener
+    if listener is not None:
+        await hass.async_add_executor_job(listener.stop)
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)

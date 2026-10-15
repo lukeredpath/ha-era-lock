@@ -5,7 +5,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "era_lock"
 
-PLATFORMS: list[Platform] = [Platform.LOCK, Platform.SENSOR]
+PLATFORMS: list[Platform] = [Platform.LOCK, Platform.SENSOR, Platform.EVENT]
 
 # --- config entry data keys --------------------------------------------------
 CONF_ERA = "era"                       # refresh token + ERA bridge config
