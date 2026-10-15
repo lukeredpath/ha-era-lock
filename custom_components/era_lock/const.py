@@ -1,10 +1,11 @@
 """Constants for the ERA Protect Lock integration."""
 from __future__ import annotations
 
+from homeassistant.const import Platform
+
 DOMAIN = "era_lock"
 
-# Platforms are added as later milestones land (lock, sensor, event).
-PLATFORMS: list[str] = []
+PLATFORMS: list[Platform] = [Platform.LOCK, Platform.SENSOR]
 
 # --- config entry data keys --------------------------------------------------
 CONF_ERA = "era"                       # refresh token + ERA bridge config

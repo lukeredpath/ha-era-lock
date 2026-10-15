@@ -1,28 +1,43 @@
 """The ERA Protect Lock integration.
 
-Skeleton setup/unload. The runtime wiring — session manager (Cognito refresh +
-Tuya session), local-poll coordinator, and the long-lived cloud MQTT listener —
-lands in milestones A/B. For now this just proves the integration loads and
-unloads cleanly as a config entry.
+Builds the runtime session manager + local-poll coordinator from the config
+entry, then sets up the lock/sensor platforms. The config (service_config +
+secrets) is merged with the code DEFAULTS into one dict each consumer reads from.
 """
 from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .const import DOMAIN, PLATFORMS
+from .const import CONF_ERA, CONF_SECRETS, CONF_SERVICE_CONFIG, CONF_SESSION, PLATFORMS
+from .coordinator import EraLockCoordinator
+from .eralock.secrets import DEFAULTS
+from .eralock.session import Session
+from .session import EraSessionManager
+
+type EraConfigEntry = ConfigEntry[EraLockCoordinator]
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: EraConfigEntry) -> bool:
     """Set up ERA Protect Lock from a config entry."""
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {}
+    d = entry.data
+    combined = {**DEFAULTS, **d[CONF_SERVICE_CONFIG], **d[CONF_SECRETS]}
+    mgr = EraSessionManager(
+        sign_secrets=combined,
+        email=d[CONF_ERA]["email"],
+        refresh_token=d[CONF_ERA]["refresh_token"],
+        session=Session.from_dict(d[CONF_SESSION]),
+    )
+    coordinator = EraLockCoordinator(hass, entry, mgr, combined)
+    # Tolerant: a failed local poll leaves entities unavailable rather than
+    # blocking setup (cloud unlock still works without the LAN).
+    await coordinator.async_refresh()
+    entry.runtime_data = coordinator
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: EraConfigEntry) -> bool:
     """Unload a config entry."""
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id, None)
-    return unload_ok
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
