@@ -41,7 +41,7 @@ _LOGGER = logging.getLogger(__name__)
 
 # service_config.json (pasted) must contain these public ERA/Tuya app constants.
 _SERVICE_REQUIRED = ("cognito_client_id", "cognito_region", "appsync_url",
-                     "clientId", "era_device_type")
+                     "clientId")
 # Secret/sensitive values entered as individual fields.
 SECRET_FIELDS = ("hmac_key", "local_key")                         # masked
 SENSITIVE_FIELDS = ("hub_id", "lock_cid", "chKey", "mqtt_client_id")  # required

@@ -31,6 +31,7 @@ STATE_PATH = HOME / "lock_state.json"  # local inference cache (gitignored)
 # combined dict; a value present in the config files overrides them.
 DEFAULTS: dict = {
     "device_id": "era-lock-cli",
+    "era_device_type": "era-lock-cli",
     "country_code": "+44",
     "version": 3.4,
 }

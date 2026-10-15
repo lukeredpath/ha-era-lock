@@ -61,9 +61,11 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
         return None if v is None else bool(v)
 
     async def async_lock(self, **kwargs: Any) -> None:
-        raise HomeAssistantError(
-            "This lock relocks automatically; manual locking isn't supported."
-        )
+        # No hardware lock command (the lock auto-relocks), so this is a manual
+        # "mark as locked": optimistically assert the secured state the
+        # integration can't otherwise detect (the mechanical thumbturn is silent).
+        self._optimistic = True
+        self.async_write_ha_state()
 
     async def async_unlock(self, **kwargs: Any) -> None:
         await self.hass.async_add_executor_job(self._unlock)

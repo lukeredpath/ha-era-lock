@@ -34,7 +34,7 @@
     },
     "error": {
       "invalid_json": "service_config isn't valid JSON.",
-      "invalid_service": "service_config.json is missing required fields (cognito_client_id, cognito_region, appsync_url, clientId, era_device_type).",
+      "invalid_service": "service_config.json is missing required fields (cognito_client_id, cognito_region, appsync_url, clientId).",
       "invalid_auth": "Incorrect ERA email/password, or an invalid signing key.",
       "mqtt_failed": "Connected to ERA, but the Tuya cloud rejected the connection — check the hub keys (local key / cid / hub id).",
       "bad_local_key": "Could not read the lock over the LAN — check the Hub local key and Hub IP.",
