@@ -1,10 +1,3 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="custom_integrations/era_lock/dark_logo.png">
-    <img alt="ERA Protect" src="custom_integrations/era_lock/logo.png" width="200">
-  </picture>
-</p>
-
 # ERA Protect Lock — Home Assistant integration
 
 A custom [Home Assistant](https://www.home-assistant.io/) integration for the
