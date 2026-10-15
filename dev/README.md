@@ -6,13 +6,14 @@ planes work here.
 
 ## Setup
 
-Home Assistant supports Python 3.12/3.13 (not 3.14 yet), so use `python3.13`:
+Home Assistant **2026.3+ requires Python ≥3.14.2**, so use `python3.14`. Pin the
+HA version to match your production instance so dev mirrors prod:
 
 ```sh
 cd dev
-python3.13 -m venv .venv
+python3.14 -m venv .venv
 ./.venv/bin/pip install --upgrade pip
-./.venv/bin/pip install homeassistant
+./.venv/bin/pip install 'homeassistant==2026.10.1'   # match your running HA
 
 # minimal config dir + live symlink to the component
 mkdir -p dev-config/custom_components
