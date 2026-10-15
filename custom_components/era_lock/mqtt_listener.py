@@ -39,11 +39,30 @@ def signal_state(entry_id: str) -> str:
     return f"{DOMAIN}_{entry_id}_state"
 
 
-def _b64_int(value) -> int | None:
-    try:
-        return int.from_bytes(base64.b64decode(value), "big")
-    except Exception:  # noqa: BLE001
-        return None
+def _truthy(v) -> bool:
+    return (v is True or (isinstance(v, (int, float)) and bool(v))
+            or str(v).lower() in ("true", "1", "on"))
+
+
+def _dp_value(raw) -> int | None:
+    """Decode a method-DP value to its credential id.
+
+    Over MQTT these arrive typed: bools (state dps), ints (method/credential
+    ids, e.g. dp62=0 for app-remote), or base64 strings (raw-type dps).
+    """
+    if isinstance(raw, bool):
+        return int(raw)
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return int.from_bytes(base64.b64decode(raw), "big")
+        except Exception:  # noqa: BLE001
+            try:
+                return int(raw)
+            except ValueError:
+                return None
+    return None
 
 
 class EraMqttListener:
@@ -121,25 +140,27 @@ class EraMqttListener:
         if data.get("cid") != self._helper.cid or not isinstance(dps, dict):
             return
 
-        if dps.get(UNLOCK_ECHO[0]) == UNLOCK_ECHO[1]:
-            self._dispatch(signal_state, False)  # unlocked
-
+        unlocked = dps.get(UNLOCK_ECHO[0]) == UNLOCK_ECHO[1]  # dp61 "AEkA"
         for dp, raw in dps.items():
             try:
                 dp_id = int(dp)
             except (TypeError, ValueError):
                 continue
             if dp_id in dpmap.METHOD_DP_LABELS:
-                cred = _b64_int(raw)
-                who = dpmap.attribute(dp_id, cred if cred is not None else 0, self._roster)
+                cred = _dp_value(raw)
                 self._dispatch(signal_event, {
                     "method": dpmap.METHOD_DP_LABELS[dp_id],
-                    "who": who,
+                    "who": dpmap.attribute(dp_id, cred if cred is not None else 0,
+                                           self._roster),
                     "credential_id": cred,
                 })
-                self._dispatch(signal_state, False)  # an unlock happened
-            elif dp_id == dpmap.UNLOCK_EVENT_DP:  # dp11 anti_lock state
-                self._dispatch(signal_state, bool(_b64_int(raw)))
+                unlocked = True
+        if unlocked:
+            self._dispatch(signal_state, False)  # unlocked -> lock entity starts relock timer
+        # NOTE: dp11 ("anti_lock") is intentionally NOT used for state yet — it
+        # bounces during an unlock and the device emits no clean relock signal,
+        # so "locked" is inferred by the lock entity's fallback timer. Raw frames
+        # are debug-logged for the locked-state investigation.
 
     def _dispatch(self, signal_fn, payload) -> None:
         self.hass.loop.call_soon_threadsafe(

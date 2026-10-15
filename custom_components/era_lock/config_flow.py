@@ -21,16 +21,35 @@ import logging
 from typing import Any
 
 import voluptuous as vol
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.selector import (
+    EntitySelector,
+    EntitySelectorConfig,
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
     TextSelector,
     TextSelectorConfig,
     TextSelectorType,
 )
 
-from .const import CONF_ERA, CONF_SECRETS, CONF_SERVICE_CONFIG, CONF_SESSION, DOMAIN
+from .const import (
+    CONF_AUTO_RELOCK_SECONDS,
+    CONF_DOOR_CONTACT_ENTITY_ID,
+    CONF_ERA,
+    CONF_SECRETS,
+    CONF_SERVICE_CONFIG,
+    CONF_SESSION,
+    DEFAULT_AUTO_RELOCK_SECONDS,
+    DOMAIN,
+)
 from .eralock.era import EraAuthError
 from .eralock.local import LocalLock
 from .eralock.mqtt import CloudMqttLock, MqttUnlockError
@@ -127,6 +146,11 @@ class EraLockConfigFlow(ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> "EraLockOptionsFlow":
+        return EraLockOptionsFlow()
+
     def __init__(self) -> None:
         self._user: dict[str, Any] = {}
 
@@ -202,3 +226,30 @@ class EraLockConfigFlow(ConfigFlow, domain=DOMAIN):
             errors=errors,
             description_placeholders={"email": entry.data[CONF_ERA]["email"]},
         )
+
+
+class EraLockOptionsFlow(OptionsFlow):
+    """Tuning options: the auto-relock window and an optional door contact."""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        if user_input is not None:
+            data = {k: v for k, v in user_input.items() if v not in (None, "")}
+            return self.async_create_entry(title="", data=data)
+
+        o = self.config_entry.options
+        schema = vol.Schema({
+            vol.Required(
+                CONF_AUTO_RELOCK_SECONDS,
+                default=o.get(CONF_AUTO_RELOCK_SECONDS, DEFAULT_AUTO_RELOCK_SECONDS),
+            ): NumberSelector(NumberSelectorConfig(
+                min=0, max=600, step=1, mode=NumberSelectorMode.BOX,
+                unit_of_measurement="s")),
+            vol.Optional(
+                CONF_DOOR_CONTACT_ENTITY_ID,
+                description={"suggested_value": o.get(CONF_DOOR_CONTACT_ENTITY_ID)},
+            ): EntitySelector(EntitySelectorConfig(
+                domain="binary_sensor", device_class="door")),
+        })
+        return self.async_show_form(step_id="init", data_schema=schema)

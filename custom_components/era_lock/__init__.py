@@ -41,7 +41,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: EraConfigEntry) -> bool:
     listener = EraMqttListener(hass, mgr, combined, entry.entry_id)
     coordinator.listener = listener
     await hass.async_add_executor_job(listener.start)
+
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     return True
+
+
+async def _async_update_listener(hass: HomeAssistant, entry: EraConfigEntry) -> None:
+    """Reload the entry when options change (door contact / relock window)."""
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: EraConfigEntry) -> bool:
