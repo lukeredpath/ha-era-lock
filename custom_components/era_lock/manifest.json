@@ -1,0 +1,17 @@
+{
+  "domain": "era_lock",
+  "name": "ERA Protect Lock",
+  "version": "0.1.0",
+  "config_flow": true,
+  "documentation": "https://github.com/lukeredpath/ha-era-lock",
+  "issue_tracker": "https://github.com/lukeredpath/ha-era-lock/issues",
+  "codeowners": ["@lukeredpath"],
+  "iot_class": "cloud_push",
+  "integration_type": "device",
+  "requirements": [
+    "tinytuya==1.20.0",
+    "paho-mqtt==2.1.0",
+    "pycryptodome==3.24.1",
+    "boto3==1.43.113"
+  ]
+}

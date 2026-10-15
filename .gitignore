@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Local HA dev environment (never commit a running config or its secrets)
+dev/.venv/
+dev/dev-config/.storage/
+dev/dev-config/*.log*
+dev/dev-config/.cloud/
+dev/dev-config/deps/
+dev/dev-config/tts/
+
+# Secrets must never live in this public repo (defensive — they belong in the
+# HA config entry at runtime, never in source)
+*secrets.json
+era_keychain.json
+*.kcpass
+lock_state.json
+
+# Archive dir (never delete; move here)
+.deleted/
