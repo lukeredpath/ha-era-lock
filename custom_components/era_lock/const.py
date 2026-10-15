@@ -6,11 +6,11 @@ DOMAIN = "era_lock"
 # Platforms are added as later milestones land (lock, sensor, event).
 PLATFORMS: list[str] = []
 
-# --- config entry data keys (shapes mirror the eralock library dicts) --------
-CONF_ERA = "era"                    # refresh token + ERA bridge config
-CONF_SESSION = "session"            # eralock.session.Session dict
-CONF_SIGN_SECRETS = "sign_secrets"  # fleet Tuya app signing blob
-CONF_LOCK_SECRETS = "lock_secrets"  # per-device: hub_id/cid/local_key/hub_ip/roster
+# --- config entry data keys --------------------------------------------------
+CONF_ERA = "era"                       # refresh token + ERA bridge config
+CONF_SESSION = "session"               # eralock.session.Session dict
+CONF_SERVICE_CONFIG = "service_config"  # non-secret ERA/Tuya service + device config
+CONF_SECRETS = "secrets"               # secret key material (hmac_key, local keys)
 
 # --- options keys ------------------------------------------------------------
 CONF_SCAN_INTERVAL = "scan_interval"

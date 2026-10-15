@@ -1,10 +1,14 @@
 """Centralised loading of key material as configuration values.
 
-Every secret the lock needs (hub localKey, lock cid, Tuya app signing material,
-member roster) is a configuration input, not a baked-in constant. Today they are
-read from gitignored JSON files at the repo root; the Home Assistant integration
-will supply the same dict shapes from its config entry instead. Keep this module
-the ONLY place that knows where secrets come from.
+Config is split into two files at the repo root (override the location with the
+ERA_LOCK_HOME env var):
+  - service_config.json : non-secret ERA/Tuya service + device config
+  - secrets.json        : secret key material (hmac_key, local keys, ...)
+
+They are merged ({**service_config, **secrets}) into the single dict the rest of
+the library consumes; each consumer picks the keys it needs. The Home Assistant
+integration supplies the same merged dict from its config entry instead. Keep
+this module the ONLY place that knows where secrets come from.
 """
 from __future__ import annotations
 
@@ -12,19 +16,19 @@ import json
 import os
 from pathlib import Path
 
-# Repo root = two levels up from this file (src/eralock/secrets.py). Overridable
-# so HA / tests can point elsewhere without touching callers.
+# Repo root = two levels up from this file. Overridable so HA / tests can point
+# elsewhere without touching callers.
 _DEFAULT_HOME = Path(__file__).resolve().parents[2]
 HOME = Path(os.environ.get("ERA_LOCK_HOME", _DEFAULT_HOME))
 
-LOCK_SECRETS_PATH = HOME / "lock_secrets.json"
-SIGN_SECRETS_PATH = HOME / "sign_secrets.json"
+SERVICE_CONFIG_PATH = HOME / "service_config.json"
+SECRETS_PATH = HOME / "secrets.json"
 MQTT_SECRETS_PATH = HOME / "mqtt_secrets.json"
 STATE_PATH = HOME / "lock_state.json"  # local inference cache (gitignored)
 
 
 class SecretsError(RuntimeError):
-    """A required secrets file is missing, malformed, or incomplete."""
+    """A required config/secrets file is missing, malformed, or incomplete."""
 
 
 def redact(key: str | None) -> str:
@@ -37,8 +41,8 @@ def redact(key: str | None) -> str:
 def _load_json(path: Path) -> dict:
     if not path.exists():
         raise SecretsError(
-            f"{path.name} not found at {path.parent}. Populate it from the research "
-            f"capture (see research/FINDINGS.md), or set ERA_LOCK_HOME."
+            f"{path.name} not found at {path.parent}. Copy {path.stem}.template.json "
+            f"to {path.name} and fill it in, or set ERA_LOCK_HOME."
         )
     try:
         with path.open() as fh:
@@ -47,30 +51,45 @@ def _load_json(path: Path) -> dict:
         raise SecretsError(f"{path.name} is not valid JSON: {e}") from e
 
 
-def load_lock_secrets(path: Path | str | None = None) -> dict:
-    """Local-control secrets (hub id/ip/localKey, lock cid, DP overrides, roster)."""
-    d = _load_json(Path(path) if path else LOCK_SECRETS_PATH)
-    for required in ("hub_id", "hub_ip", "local_key"):
-        if not d.get(required):
-            raise SecretsError(f"lock_secrets.json is missing required field: {required}")
-    return d
+def load_service_config(path: Path | str | None = None) -> dict:
+    """Non-secret ERA/Tuya service + device config."""
+    return _load_json(Path(path) if path else SERVICE_CONFIG_PATH)
+
+
+def load_secrets(path: Path | str | None = None) -> dict:
+    """Secret key material (hmac_key, local keys, ...)."""
+    return _load_json(Path(path) if path else SECRETS_PATH)
+
+
+def load_combined() -> dict:
+    """Merge service_config + secrets into one dict (secrets win on overlap)."""
+    return {**load_service_config(), **load_secrets()}
 
 
 def load_sign_secrets(path: Path | str | None = None) -> dict:
-    """Tuya mobile-API signing material (appSecret, clientId, assembled hmac_key)."""
-    d = _load_json(Path(path) if path else SIGN_SECRETS_PATH)
-    if not (d.get("hmac_key") or (d.get("package") and d.get("appSecret"))):
-        raise SecretsError("sign_secrets.json has no usable hmac_key / signing material")
+    """Signing / ERA-bridge material (merged). Requires hmac_key + clientId."""
+    d = load_combined()
+    if not d.get("hmac_key"):
+        raise SecretsError("secrets.json is missing 'hmac_key'")
+    if not d.get("clientId"):
+        raise SecretsError("service_config.json is missing 'clientId'")
+    return d
+
+
+def load_lock_secrets(path: Path | str | None = None) -> dict:
+    """Local/cloud device material (merged). Requires hub_id + local_key."""
+    d = load_combined()
+    for required in ("hub_id", "local_key"):
+        if not d.get(required):
+            raise SecretsError(f"config is missing required field: {required}")
     return d
 
 
 def load_mqtt_secrets(path: Path | str | None = None) -> dict:
     """Tuya MQTT connect credentials (broker, clientId, username, password).
 
-    NOTE: these are SESSION-derived and ephemeral — captured live from the app
-    (research/frida/frida_mqtt_creds.js). Until the login-derivation (step B) is
-    implemented, they expire and must be re-captured. In HA this is the slot the
-    config entry / a login routine will fill.
+    NOTE: these are SESSION-derived and ephemeral. In HA this slot is filled by
+    deriving them from the session at runtime (see eralock.session).
     """
     d = _load_json(Path(path) if path else MQTT_SECRETS_PATH)
     for required in ("broker", "clientId", "username", "password"):

@@ -1,10 +1,12 @@
 """Config flow for ERA Protect Lock.
 
 Two steps:
-  1. user     — ERA email + password.
-  2. secrets  — the fleet Tuya signing blob (sign_secrets) and the per-device
-                lock_secrets, pasted as JSON. These never ship in the repo; they
-                live only in the config entry.
+  1. user    — ERA email + password.
+  2. config  — paste the two config files:
+                 * service_config — non-secret ERA/Tuya service + device config
+                 * secrets        — secret key material (hmac_key, local keys)
+               They are merged ({**service_config, **secrets}); each consumer
+               picks the keys it needs. Nothing is bundled in the repo.
 
 Validation runs the real login (Cognito refresh token + Tuya session) and a
 short Tuya-MQTT connect, so a created entry is known-good. A reauth step
@@ -28,9 +30,9 @@ from homeassistant.helpers.selector import (
 
 from .const import (
     CONF_ERA,
-    CONF_LOCK_SECRETS,
+    CONF_SECRETS,
+    CONF_SERVICE_CONFIG,
     CONF_SESSION,
-    CONF_SIGN_SECRETS,
     DOMAIN,
 )
 from .eralock.era import EraAuthError
@@ -39,9 +41,9 @@ from .session import EraSessionManager, initial_login
 
 _LOGGER = logging.getLogger(__name__)
 
-_SIGN_REQUIRED = ("cognito_client_id", "cognito_region", "appsync_url",
-                  "hmac_key", "clientId", "mqtt_client_id")
-_LOCK_REQUIRED = ("hub_id", "lock_cid", "local_key")
+_SERVICE_REQUIRED = ("cognito_client_id", "cognito_region", "appsync_url",
+                     "clientId", "chKey", "mqtt_client_id", "hub_id", "lock_cid")
+_SECRETS_REQUIRED = ("hmac_key", "local_key")
 
 _JSON = TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT, multiline=True))
 
@@ -49,9 +51,9 @@ _USER_SCHEMA = vol.Schema({
     vol.Required(CONF_USERNAME): str,
     vol.Required(CONF_PASSWORD): str,
 })
-_SECRETS_SCHEMA = vol.Schema({
-    vol.Required(CONF_SIGN_SECRETS): _JSON,
-    vol.Required(CONF_LOCK_SECRETS): _JSON,
+_CONFIG_SCHEMA = vol.Schema({
+    vol.Required(CONF_SERVICE_CONFIG): _JSON,
+    vol.Required(CONF_SECRETS): _JSON,
 })
 
 
@@ -71,21 +73,21 @@ def _parse(blob: str, required: tuple[str, ...], err: str) -> dict:
     return d
 
 
-def _validate_sync(email: str, password: str, sign: dict, lock: dict) -> dict:
+def _validate_sync(email: str, password: str, combined: dict) -> dict:
     """Blocking: real login + MQTT connect. Returns the credential state."""
-    refresh_token, session = initial_login(email, password, sign_secrets=sign)
-    mgr = EraSessionManager(sign_secrets=sign, email=email,
+    refresh_token, session = initial_login(email, password, sign_secrets=combined)
+    mgr = EraSessionManager(sign_secrets=combined, email=email,
                             refresh_token=refresh_token, session=session)
     # short connect-only check (subscribes, no publish -> never actuates)
-    CloudMqttLock(lock, mgr.mqtt_secrets()).watch(0.3, lambda *_: None)
+    CloudMqttLock(combined, mgr.mqtt_secrets()).watch(0.3, lambda *_: None)
     return {"refresh_token": refresh_token, "session": session}
 
 
 async def _validate(hass: HomeAssistant, email: str, password: str,
-                    sign: dict, lock: dict) -> dict:
+                    combined: dict) -> dict:
     try:
         return await hass.async_add_executor_job(
-            _validate_sync, email, password, sign, lock)
+            _validate_sync, email, password, combined)
     except EraAuthError as e:
         _LOGGER.debug("ERA auth failed: %s", e)
         raise _ValidationError("invalid_auth") from e
@@ -113,35 +115,38 @@ class EraLockConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is None:
             return self.async_show_form(step_id="user", data_schema=_USER_SCHEMA)
         self._user = user_input
-        return await self.async_step_secrets()
+        return await self.async_step_config()
 
-    async def async_step_secrets(
+    async def async_step_config(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         errors: dict[str, str] = {}
         if user_input is not None:
             try:
-                sign = _parse(user_input[CONF_SIGN_SECRETS], _SIGN_REQUIRED, "invalid_sign")
-                lock = _parse(user_input[CONF_LOCK_SECRETS], _LOCK_REQUIRED, "invalid_lock")
+                service = _parse(user_input[CONF_SERVICE_CONFIG],
+                                 _SERVICE_REQUIRED, "invalid_service")
+                secrets = _parse(user_input[CONF_SECRETS],
+                                 _SECRETS_REQUIRED, "invalid_secrets")
+                combined = {**service, **secrets}
                 email = self._user[CONF_USERNAME]
                 creds = await _validate(self.hass, email,
-                                        self._user[CONF_PASSWORD], sign, lock)
+                                        self._user[CONF_PASSWORD], combined)
             except _ValidationError as e:
                 errors["base"] = e.code
             else:
-                await self.async_set_unique_id(str(lock["hub_id"]))
+                await self.async_set_unique_id(str(combined["hub_id"]))
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(
                     title="ERA Protect Lock",
                     data={
                         CONF_ERA: {"refresh_token": creds["refresh_token"], "email": email},
                         CONF_SESSION: creds["session"].to_dict(),
-                        CONF_SIGN_SECRETS: sign,
-                        CONF_LOCK_SECRETS: lock,
+                        CONF_SERVICE_CONFIG: service,
+                        CONF_SECRETS: secrets,
                     },
                 )
         return self.async_show_form(
-            step_id="secrets", data_schema=_SECRETS_SCHEMA, errors=errors)
+            step_id="config", data_schema=_CONFIG_SCHEMA, errors=errors)
 
     # ------------------------------------------------------------------ reauth
     async def async_step_reauth(
@@ -156,11 +161,10 @@ class EraLockConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         if user_input is not None:
             email = entry.data[CONF_ERA]["email"]
-            sign = entry.data[CONF_SIGN_SECRETS]
-            lock = entry.data[CONF_LOCK_SECRETS]
+            combined = {**entry.data[CONF_SERVICE_CONFIG], **entry.data[CONF_SECRETS]}
             try:
                 creds = await _validate(self.hass, email,
-                                        user_input[CONF_PASSWORD], sign, lock)
+                                        user_input[CONF_PASSWORD], combined)
             except _ValidationError as e:
                 errors["base"] = e.code
             else:

@@ -9,12 +9,12 @@
           "password": "ERA password"
         }
       },
-      "secrets": {
-        "title": "Device & signing keys",
-        "description": "Paste your sign_secrets and lock_secrets JSON. These are stored only in Home Assistant's config entry and never leave your instance.",
+      "config": {
+        "title": "Service config & secrets",
+        "description": "Paste the contents of your two config files. They are stored only in Home Assistant's config entry and never leave your instance.",
         "data": {
-          "sign_secrets": "sign_secrets (JSON)",
-          "lock_secrets": "lock_secrets (JSON)"
+          "service_config": "service_config.json",
+          "secrets": "secrets.json"
         }
       },
       "reauth_confirm": {
@@ -26,11 +26,11 @@
       }
     },
     "error": {
-      "invalid_auth": "Incorrect ERA email or password.",
       "invalid_json": "That isn't valid JSON.",
-      "invalid_sign": "sign_secrets is missing required fields.",
-      "invalid_lock": "lock_secrets is missing required fields (hub_id, lock_cid, local_key).",
-      "mqtt_failed": "Could not connect to the Tuya cloud with these credentials.",
+      "invalid_service": "service_config.json is missing required fields.",
+      "invalid_secrets": "secrets.json is missing required fields (hmac_key, local_key).",
+      "invalid_auth": "Incorrect ERA email/password, or an invalid signing key.",
+      "mqtt_failed": "Connected to ERA, but the Tuya cloud rejected the connection — check the hub keys (local key / cid / hub id).",
       "unknown": "Unexpected error — see the logs."
     },
     "abort": {
