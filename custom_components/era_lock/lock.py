@@ -47,6 +47,13 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
         self._optimistic: bool | None = None
 
     @property
+    def available(self) -> bool:
+        # Unlock rides cloud MQTT, which doesn't need the local LAN poll, so the
+        # lock stays available even when the hub can't be reached locally; the
+        # state just becomes unknown.
+        return True
+
+    @property
     def is_locked(self) -> bool | None:
         if self._optimistic is not None:
             return self._optimistic
