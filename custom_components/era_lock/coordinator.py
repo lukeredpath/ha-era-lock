@@ -9,6 +9,7 @@ milestone). If no hub_ip is configured, polling is skipped and the data is empty
 from __future__ import annotations
 
 import logging
+import time
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -53,7 +54,21 @@ class EraLockCoordinator(DataUpdateCoordinator[dict]):
             raise UpdateFailed(str(e)) from e
 
     def _poll(self) -> dict:
-        dps = self._local.dps()
+        # Tuya hubs intermittently reject the first local connect (error 914);
+        # retry a couple of times, forcing a fresh connection each attempt.
+        last: Exception | None = None
+        for attempt in range(3):
+            try:
+                dps = self._local.dps()
+                break
+            except SecretsError as e:
+                last = e
+                self._local._dev = None  # force reconnect
+                if attempt < 2:
+                    time.sleep(0.6)
+        else:
+            raise last  # type: ignore[misc]
+
         battery = dps.get("8")
         try:
             battery = int(battery)
