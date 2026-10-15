@@ -32,8 +32,9 @@ from homeassistant.helpers.selector import (
 
 from .const import CONF_ERA, CONF_SECRETS, CONF_SERVICE_CONFIG, CONF_SESSION, DOMAIN
 from .eralock.era import EraAuthError
+from .eralock.local import LocalLock
 from .eralock.mqtt import CloudMqttLock, MqttUnlockError
-from .eralock.secrets import DEFAULTS
+from .eralock.secrets import DEFAULTS, SecretsError
 from .session import EraSessionManager, initial_login
 
 _LOGGER = logging.getLogger(__name__)
@@ -93,6 +94,10 @@ def _validate_sync(email: str, password: str, combined: dict) -> dict:
                             refresh_token=refresh_token, session=session)
     # short connect-only check (subscribes, no publish -> never actuates)
     CloudMqttLock(combined, mgr.mqtt_secrets()).watch(0.3, lambda *_: None)
+    # If a hub_ip is given, verify local_key with a real local read (the MQTT
+    # connect above only validates the session creds, not local_key).
+    if combined.get("hub_ip"):
+        LocalLock(combined).dps()  # raises SecretsError (e.g. 914) on a bad key
     return {"refresh_token": refresh_token, "session": session}
 
 
@@ -107,6 +112,9 @@ async def _validate(hass: HomeAssistant, email: str, password: str,
     except MqttUnlockError as e:
         _LOGGER.debug("Tuya MQTT connect failed: %s", e)
         raise _ValidationError("mqtt_failed") from e
+    except SecretsError as e:
+        _LOGGER.debug("Local read failed: %s", e)
+        raise _ValidationError("bad_local_key") from e
     except _ValidationError:
         raise
     except Exception as e:  # noqa: BLE001
