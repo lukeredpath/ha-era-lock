@@ -1,12 +1,14 @@
 """Config flow for ERA Protect Lock.
 
 Two steps:
-  1. user    — ERA email + password.
-  2. config  — paste the two config files:
-                 * service_config — non-secret ERA/Tuya service + device config
-                 * secrets        — secret key material (hmac_key, local keys)
-               They are merged ({**service_config, **secrets}); each consumer
-               picks the keys it needs. Nothing is bundled in the repo.
+  1. user   — ERA email + password.
+  2. config — paste `service_config.json` (the public, fleet-wide ERA/Tuya app
+              constants) and enter the secret + sensitive values as individual
+              fields (signing key, hub/lock keys and ids). Code-level constants
+              (device_id, country_code, Tuya version) come from
+              eralock.secrets.DEFAULTS. Everything is merged
+              ({**DEFAULTS, **service_config, **secrets}) and each consumer picks
+              the keys it needs.
 
 Validation runs the real login (Cognito refresh token + Tuya session) and a
 short Tuya-MQTT connect, so a created entry is known-good. A reauth step
@@ -28,23 +30,24 @@ from homeassistant.helpers.selector import (
     TextSelectorType,
 )
 
-from .const import (
-    CONF_ERA,
-    CONF_SECRETS,
-    CONF_SERVICE_CONFIG,
-    CONF_SESSION,
-    DOMAIN,
-)
+from .const import CONF_ERA, CONF_SECRETS, CONF_SERVICE_CONFIG, CONF_SESSION, DOMAIN
 from .eralock.era import EraAuthError
 from .eralock.mqtt import CloudMqttLock, MqttUnlockError
+from .eralock.secrets import DEFAULTS
 from .session import EraSessionManager, initial_login
 
 _LOGGER = logging.getLogger(__name__)
 
+# service_config.json (pasted) must contain these public ERA/Tuya app constants.
 _SERVICE_REQUIRED = ("cognito_client_id", "cognito_region", "appsync_url",
-                     "clientId", "chKey", "mqtt_client_id", "hub_id", "lock_cid")
-_SECRETS_REQUIRED = ("hmac_key", "local_key")
+                     "clientId", "era_device_type")
+# Secret/sensitive values entered as individual fields.
+SECRET_FIELDS = ("hmac_key", "local_key")                         # masked
+SENSITIVE_FIELDS = ("hub_id", "lock_cid", "chKey", "mqtt_client_id")  # required
+OPTIONAL_FIELDS = ("hub_ip", "lock_id")
 
+_SECRET = TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD))
+_TEXT = TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT))
 _JSON = TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT, multiline=True))
 
 _USER_SCHEMA = vol.Schema({
@@ -53,7 +56,9 @@ _USER_SCHEMA = vol.Schema({
 })
 _CONFIG_SCHEMA = vol.Schema({
     vol.Required(CONF_SERVICE_CONFIG): _JSON,
-    vol.Required(CONF_SECRETS): _JSON,
+    **{vol.Required(k): _SECRET for k in SECRET_FIELDS},
+    **{vol.Required(k): _TEXT for k in SENSITIVE_FIELDS},
+    **{vol.Optional(k): _TEXT for k in OPTIONAL_FIELDS},
 })
 
 
@@ -63,14 +68,22 @@ class _ValidationError(Exception):
         self.code = code
 
 
-def _parse(blob: str, required: tuple[str, ...], err: str) -> dict:
+def _parse_service(blob: str) -> dict:
     try:
         d = json.loads(blob)
     except (json.JSONDecodeError, TypeError) as e:
         raise _ValidationError("invalid_json") from e
-    if not isinstance(d, dict) or any(not d.get(k) for k in required):
-        raise _ValidationError(err)
+    if not isinstance(d, dict) or any(not d.get(k) for k in _SERVICE_REQUIRED):
+        raise _ValidationError("invalid_service")
     return d
+
+
+def _secrets_from_input(user_input: dict[str, Any]) -> dict:
+    secrets = {k: user_input[k] for k in (*SECRET_FIELDS, *SENSITIVE_FIELDS)}
+    for k in OPTIONAL_FIELDS:
+        if user_input.get(k):
+            secrets[k] = user_input[k]
+    return secrets
 
 
 def _validate_sync(email: str, password: str, combined: dict) -> dict:
@@ -123,18 +136,16 @@ class EraLockConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         if user_input is not None:
             try:
-                service = _parse(user_input[CONF_SERVICE_CONFIG],
-                                 _SERVICE_REQUIRED, "invalid_service")
-                secrets = _parse(user_input[CONF_SECRETS],
-                                 _SECRETS_REQUIRED, "invalid_secrets")
-                combined = {**service, **secrets}
+                service = _parse_service(user_input[CONF_SERVICE_CONFIG])
+                secrets = _secrets_from_input(user_input)
+                combined = {**DEFAULTS, **service, **secrets}
                 email = self._user[CONF_USERNAME]
                 creds = await _validate(self.hass, email,
                                         self._user[CONF_PASSWORD], combined)
             except _ValidationError as e:
                 errors["base"] = e.code
             else:
-                await self.async_set_unique_id(str(combined["hub_id"]))
+                await self.async_set_unique_id(str(secrets["hub_id"]))
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(
                     title="ERA Protect Lock",
@@ -161,7 +172,8 @@ class EraLockConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         if user_input is not None:
             email = entry.data[CONF_ERA]["email"]
-            combined = {**entry.data[CONF_SERVICE_CONFIG], **entry.data[CONF_SECRETS]}
+            combined = {**DEFAULTS, **entry.data[CONF_SERVICE_CONFIG],
+                        **entry.data[CONF_SECRETS]}
             try:
                 creds = await _validate(self.hass, email,
                                         user_input[CONF_PASSWORD], combined)

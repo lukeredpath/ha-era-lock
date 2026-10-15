@@ -10,11 +10,18 @@
         }
       },
       "config": {
-        "title": "Service config & secrets",
-        "description": "Paste the contents of your two config files. They are stored only in Home Assistant's config entry and never leave your instance.",
+        "title": "Device keys & service config",
+        "description": "Paste your service_config.json (the public ERA app constants) and enter your device keys. These are stored only in Home Assistant's config entry and never leave your instance.",
         "data": {
-          "service_config": "service_config.json",
-          "secrets": "secrets.json"
+          "service_config": "service_config.json (paste)",
+          "hmac_key": "Signing key (hmac_key)",
+          "local_key": "Hub local key",
+          "hub_id": "Hub id",
+          "lock_cid": "Lock cid",
+          "chKey": "chKey",
+          "mqtt_client_id": "MQTT client id",
+          "hub_ip": "Hub IP (optional — enables local reads)",
+          "lock_id": "Lock id (optional)"
         }
       },
       "reauth_confirm": {
@@ -26,9 +33,8 @@
       }
     },
     "error": {
-      "invalid_json": "That isn't valid JSON.",
-      "invalid_service": "service_config.json is missing required fields.",
-      "invalid_secrets": "secrets.json is missing required fields (hmac_key, local_key).",
+      "invalid_json": "service_config isn't valid JSON.",
+      "invalid_service": "service_config.json is missing required fields (cognito_client_id, cognito_region, appsync_url, clientId, era_device_type).",
       "invalid_auth": "Incorrect ERA email/password, or an invalid signing key.",
       "mqtt_failed": "Connected to ERA, but the Tuya cloud rejected the connection — check the hub keys (local key / cid / hub id).",
       "unknown": "Unexpected error — see the logs."

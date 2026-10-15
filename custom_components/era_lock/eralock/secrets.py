@@ -26,6 +26,15 @@ SECRETS_PATH = HOME / "secrets.json"
 MQTT_SECRETS_PATH = HOME / "mqtt_secrets.json"
 STATE_PATH = HOME / "lock_state.json"  # local inference cache (gitignored)
 
+# Constants that belong in code, not config: an arbitrary client device id,
+# regional defaults, and the Tuya LAN protocol version. Merged into every
+# combined dict; a value present in the config files overrides them.
+DEFAULTS: dict = {
+    "device_id": "era-lock-cli",
+    "country_code": "+44",
+    "version": 3.4,
+}
+
 
 class SecretsError(RuntimeError):
     """A required config/secrets file is missing, malformed, or incomplete."""
@@ -62,8 +71,8 @@ def load_secrets(path: Path | str | None = None) -> dict:
 
 
 def load_combined() -> dict:
-    """Merge service_config + secrets into one dict (secrets win on overlap)."""
-    return {**load_service_config(), **load_secrets()}
+    """Merge code DEFAULTS + service_config + secrets (later wins on overlap)."""
+    return {**DEFAULTS, **load_service_config(), **load_secrets()}
 
 
 def load_sign_secrets(path: Path | str | None = None) -> dict:
