@@ -6,13 +6,10 @@ __pycache__/
 .ruff_cache/
 .pytest_cache/
 
-# Local HA dev environment (never commit a running config or its secrets)
+# Local HA dev environment (never commit a running config, its storage, or the
+# machine-specific component symlink — dev/README.md documents how to recreate it)
 dev/.venv/
-dev/dev-config/.storage/
-dev/dev-config/*.log*
-dev/dev-config/.cloud/
-dev/dev-config/deps/
-dev/dev-config/tts/
+dev/dev-config/
 
 # Secrets must never live in this public repo (defensive — they belong in the
 # HA config entry at runtime, never in source)
