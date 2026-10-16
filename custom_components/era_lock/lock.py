@@ -47,6 +47,7 @@ _LOGGER = logging.getLogger(__name__)
 
 LOCKED = "locked"
 UNLOCKED = "unlocked"
+DEVICE_DEBOUNCE_S = 2.0  # coalesce dp11 mini-history bursts into one transition
 
 
 async def async_setup_entry(
@@ -74,6 +75,8 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
         self._last_method: str | None = None
         self._last_user: str | None = None
         self._logged_state: str | None = "__init__"  # for logbook de-dupe
+        self._pending_device: tuple[bool, str | None] | None = None
+        self._device_debounce = None
 
     # -- options --------------------------------------------------------------
     @property
@@ -106,6 +109,7 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
                     self.hass, [self._door_entity], self._on_door)
             )
         self.async_on_remove(self._cancel_relock)
+        self.async_on_remove(self._cancel_device_debounce)
 
     @property
     def available(self) -> bool:
@@ -164,6 +168,12 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
             self._relock_cancel = None
 
     @callback
+    def _cancel_device_debounce(self) -> None:
+        if self._device_debounce is not None:
+            self._device_debounce()
+            self._device_debounce = None
+
+    @callback
     def _relock_fired(self, _now) -> None:
         self._relock_cancel = None
         if self._door_open():
@@ -179,20 +189,41 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
     # -- inputs ---------------------------------------------------------------
     @callback
     def _on_push_state(self, payload) -> None:
-        # payload is {"locked": bool, "method": str|None, "who": str|None}
-        locked = payload.get("locked") if isinstance(payload, dict) else bool(payload)
-        method = payload.get("method") if isinstance(payload, dict) else None
-        who = payload.get("who") if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            return
+        source = payload.get("source")
+        method = payload.get("method")
+        who = payload.get("who")
+        if source == "device":
+            # The lock replays a dp11 mini-history burst on wake; debounce and
+            # apply only the final state so the lock doesn't flicker.
+            self._pending_device = (bool(payload.get("locked")), method)
+            if self._device_debounce is not None:
+                self._device_debounce()
+            self._device_debounce = async_call_later(
+                self.hass, DEVICE_DEBOUNCE_S, self._apply_device)
+            return
+        # event-driven (an actual unlock) -> apply immediately
+        self._last_method = method
+        self._last_user = who
+        self._transition(UNLOCKED, who or method or "unlock")
+        self._start_relock()
+        if self.coordinator.wake is not None:
+            self.coordinator.wake.on_unlock()  # confirm the relock shortly after
+
+    @callback
+    def _apply_device(self, _now=None) -> None:
+        self._device_debounce = None
+        if self._pending_device is None:
+            return
+        locked, method = self._pending_device
+        self._pending_device = None
         if locked:
             self._cancel_relock()
-            self._transition(LOCKED, method or "event")
+            self._transition(LOCKED, method or "auto-relock (device)")
         else:
-            self._last_method = method
-            self._last_user = who
-            self._transition(UNLOCKED, who or method or "unlock")
-            self._start_relock()
-            if self.coordinator.wake is not None:
-                self.coordinator.wake.on_unlock()  # confirm the relock shortly after
+            # device-confirmed unlocked is authoritative; don't restart the timer
+            self._transition(UNLOCKED, method or "device")
 
     @callback
     def _on_door(self, event: Event) -> None:

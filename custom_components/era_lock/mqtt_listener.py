@@ -30,6 +30,11 @@ from .session import EraSessionManager
 
 _LOGGER = logging.getLogger(__name__)
 
+# A dp11 change whose device event-time is older than this behind the frame time
+# is a buffered history replay (the lock dumps changes when it wakes), not a live
+# transition, so it doesn't drive state.
+STALE_STATE_S = 20
+
 
 def signal_event(entry_id: str) -> str:
     return f"{DOMAIN}_{entry_id}_event"
@@ -165,12 +170,13 @@ class EraMqttListener:
         # unlocked. It's delivered when the BLE lock wakes (with each dp's real
         # event time in data.t), so guard against stale replays by timestamp.
         if "11" in dps:
-            ts = tmap.get("11", frame_t)
-            if ts >= self._last_state_ts:
-                self._last_state_ts = ts
+            dp_ts = tmap.get("11")
+            fresh = dp_ts is None or (frame_t - dp_ts) <= STALE_STATE_S
+            if fresh and frame_t >= self._last_state_ts:
+                self._last_state_ts = frame_t
                 locked = bool(dps["11"])
                 self._dispatch(signal_state, {
-                    "locked": locked,
+                    "locked": locked, "source": "device",
                     "method": "auto-relock (device)" if locked else "device",
                 })
 
@@ -195,7 +201,8 @@ class EraMqttListener:
                 unlocked = True
         if unlocked and frame_t >= self._last_state_ts:
             self._last_state_ts = frame_t
-            self._dispatch(signal_state, {"locked": False, "method": method, "who": who})
+            self._dispatch(signal_state, {
+                "locked": False, "source": "event", "method": method, "who": who})
 
     def _dispatch(self, signal_fn, payload) -> None:
         self.hass.loop.call_soon_threadsafe(
