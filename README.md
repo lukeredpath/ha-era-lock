@@ -14,9 +14,9 @@ Wi-Fi hub and fronted by ERA's cloud. Installable via [HACS](https://hacs.xyz/).
 > will be removed on the trademark owner's request.
 
 > **Status: working, in active development.** Config flow, cloud unlock, the
-> battery sensor, and the inferred lock-state engine are functional and have been
-> validated against real hardware. Named per-credential attribution (labelling
-> fingerprints/key cards and mapping them to HA users) is the current work.
+> battery sensor, the inferred lock-state engine, and per-credential unlock
+> attribution are implemented; the lock-state engine has been validated against
+> real hardware.
 
 ## What it exposes
 
@@ -38,9 +38,16 @@ Wi-Fi hub and fronted by ERA's cloud. Installable via [HACS](https://hacs.xyz/).
 - **`button`** — **Sync**: force the BLE lock to wake and report, flushing any
   buffered events (use sparingly — waking the lock costs battery).
 
-Unlock attribution: Home Assistant unlocks are credited to the HA user who
-issued them. Fingerprint/key-card attribution (custom labels, optional HA-user
-mapping) is in progress.
+### Unlock attribution
+
+- **Home Assistant unlocks** are credited to the HA user who issued them.
+- **Fingerprints and key cards** can be labelled, and optionally mapped to an HA
+  user, in the integration's options (**Settings → Devices & Services → ERA
+  Protect Lock → Configure → Unlock credentials**). When an enrolled credential
+  unlocks the door, the activity log shows the mapped HA user (with the method,
+  e.g. *fingerprint*); if it isn't mapped, the custom label is shown as a
+  fallback. These labels live in Home Assistant and are not synced from the ERA
+  cloud.
 
 ## No secrets ship in this repo
 
