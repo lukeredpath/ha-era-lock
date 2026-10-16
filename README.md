@@ -41,13 +41,15 @@ Wi-Fi hub and fronted by ERA's cloud. Installable via [HACS](https://hacs.xyz/).
 ### Unlock attribution
 
 - **Home Assistant unlocks** are credited to the HA user who issued them.
-- **Fingerprints and key cards** can be labelled, and optionally mapped to an HA
-  user, in the integration's options (**Settings → Devices & Services → ERA
-  Protect Lock → Configure → Unlock credentials**). When an enrolled credential
-  unlocks the door, the activity log shows the mapped HA user (with the method,
-  e.g. *fingerprint*); if it isn't mapped, the custom label is shown as a
-  fallback. These labels live in Home Assistant and are not synced from the ERA
-  cloud.
+- **Fingerprints and key cards** are **auto-discovered**: the first time a new
+  credential unlocks the door, the integration adds it to the roster and raises a
+  notification, so all you do is give it a label and (optionally) map it to a
+  Home Assistant user — under **Settings → Devices & Services → ERA Protect Lock →
+  Configure → Unlock credentials**.
+- When an enrolled credential unlocks the door, the activity log attributes it to
+  the mapped **HA user** (naming the method, e.g. *fingerprint*); if it isn't
+  mapped, the custom **label** is shown as a fallback. These labels live in Home
+  Assistant and are not synced from the ERA cloud.
 
 ## No secrets ship in this repo
 

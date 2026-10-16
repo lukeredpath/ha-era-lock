@@ -11,6 +11,7 @@ from homeassistant.core import HomeAssistant
 
 from .const import (
     CONF_AUTO_RELOCK_SECONDS,
+    CONF_CREDENTIALS,
     CONF_ERA,
     CONF_SECRETS,
     CONF_SERVICE_CONFIG,
@@ -41,6 +42,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: EraConfigEntry) -> bool:
         session=Session.from_dict(d[CONF_SESSION]),
     )
     coordinator = EraLockCoordinator(hass, entry, mgr, combined)
+    # Snapshot the reload-relevant options so a later credentials-only change
+    # (auto-discovery, label/user edits) doesn't needlessly reload the entry.
+    coordinator.options_snapshot = _reload_relevant(entry.options)
     # Tolerant: a failed local poll leaves entities unavailable rather than
     # blocking setup (cloud unlock still works without the LAN).
     await coordinator.async_refresh()
@@ -66,8 +70,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: EraConfigEntry) -> bool:
     return True
 
 
+def _reload_relevant(options: dict) -> dict:
+    """Options whose change requires a reload — everything except the credential
+    roster, which the entities read live."""
+    return {k: v for k, v in options.items() if k != CONF_CREDENTIALS}
+
+
 async def _async_update_listener(hass: HomeAssistant, entry: EraConfigEntry) -> None:
-    """Reload the entry when options change (door contact / relock window)."""
+    """Reload the entry when reload-relevant options change (door contact, relock
+    window, heartbeat). A credentials-only change — auto-discovery or a label/user
+    edit — is read live by the entities, so skip the reload (and the state reset
+    it would cause right after an unlock)."""
+    coordinator = entry.runtime_data
+    current = _reload_relevant(entry.options)
+    if getattr(coordinator, "options_snapshot", None) == current:
+        return
+    coordinator.options_snapshot = current
     await hass.config_entries.async_reload(entry.entry_id)
 
 

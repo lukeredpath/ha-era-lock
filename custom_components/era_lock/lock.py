@@ -20,6 +20,7 @@ import logging
 import time
 from typing import Any
 
+from homeassistant.components import persistent_notification
 from homeassistant.components.lock import LockEntity
 from homeassistant.core import Context, Event, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
@@ -37,7 +38,9 @@ from .const import (
     CONF_AUTO_RELOCK_SECONDS,
     CONF_CREDENTIALS,
     CONF_DOOR_CONTACT_ENTITY_ID,
+    CREDENTIAL_METHODS,
     DEFAULT_AUTO_RELOCK_SECONDS,
+    DOMAIN,
     EVENT_CAUSE,
 )
 from .coordinator import EraLockCoordinator
@@ -228,6 +231,12 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
         fresh = payload.get("fresh", True)
         locked = payload.get("locked")
 
+        # Auto-discover a newly-seen fingerprint/card id (fresh or buffered), so
+        # the user only has to label it. Runs before the ordering guard so even a
+        # superseded flush event registers its credential.
+        if source == "event" and method in CREDENTIAL_METHODS:
+            self._maybe_discover_credential(method, payload.get("cred"))
+
         # Immediate side-effects for FRESH (live) events only.
         if fresh:
             if source == "event" and not locked:
@@ -292,17 +301,48 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
             for c in self._options.get(CONF_CREDENTIALS, []):
                 if c.get("method") == method and _as_int(c.get("id")) == cred_i:
                     uid = c.get("user_id") or None
+                    label = (c.get("label") or "").strip()
                     if uid:
                         name = c.get("user_name") or "a Home Assistant user"
-                        return f"Unlocked ({method})", name, uid
-                    label = (c.get("label") or "").strip() or f"{method} #{cred_i}"
-                    return f"Unlocked by {label} ({method})", label, None
+                        return f"Unlocked by {name} ({method})", name, uid
+                    if label:
+                        return f"Unlocked by {label} ({method})", label, None
+                    break  # auto-discovered but not yet labelled -> raw fallback
         if who:
             return f"Unlocked by {who}", who, None
         if method:
             tag = f"{method} #{cred_i}" if cred_i is not None else method
             return f"Unlocked ({tag})", None, None
         return "Unlocked", None, None
+
+    @callback
+    def _maybe_discover_credential(self, method: str, cred) -> None:
+        """Auto-add a newly-seen credential id to the roster (blank label) and
+        raise a persistent notification, so the user only has to fill in the
+        label and (optionally) map it to an HA user. Credentials-only option
+        writes don't reload the entry (see __init__._async_update_listener)."""
+        cred_i = _as_int(cred)
+        if cred_i is None:
+            return
+        entry = self.coordinator.config_entry
+        creds = list(entry.options.get(CONF_CREDENTIALS, []))
+        if any(c.get("method") == method and _as_int(c.get("id")) == cred_i
+               for c in creds):
+            return  # already known
+        creds.append({"method": method, "id": cred_i, "label": ""})
+        self.hass.config_entries.async_update_entry(
+            entry, options={**entry.options, CONF_CREDENTIALS: creds})
+        _LOGGER.info("Discovered new %s credential #%s", method, cred_i)
+        persistent_notification.async_create(
+            self.hass,
+            f"A new **{method}** credential (#{cred_i}) just unlocked the ERA "
+            f"Protect Lock. Add a label and (optionally) map it to a Home "
+            f"Assistant user in the integration's options "
+            f"(Settings → Devices & Services → ERA Protect Lock → Configure → "
+            f"Unlock credentials).",
+            title="New lock credential detected",
+            notification_id=f"{DOMAIN}_new_cred_{method}_{cred_i}",
+        )
 
     @callback
     def _on_door(self, event: Event) -> None:
