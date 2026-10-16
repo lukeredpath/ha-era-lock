@@ -20,6 +20,7 @@ import logging
 from typing import Any
 
 from homeassistant.components.lock import LockEntity
+from homeassistant.components.logbook import async_log_entry
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
@@ -35,6 +36,7 @@ from .const import (
     CONF_AUTO_RELOCK_SECONDS,
     CONF_DOOR_CONTACT_ENTITY_ID,
     DEFAULT_AUTO_RELOCK_SECONDS,
+    DOMAIN,
 )
 from .coordinator import EraLockCoordinator
 from .entity import device_info
@@ -71,6 +73,7 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
         self._changed_by: str | None = None
         self._last_method: str | None = None
         self._last_user: str | None = None
+        self._logged_state: str | None = "__init__"  # for logbook de-dupe
 
     # -- options --------------------------------------------------------------
     @property
@@ -135,9 +138,15 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
 
     @callback
     def _transition(self, state: str | None, reason: str) -> None:
-        """Change state and record what caused it."""
+        """Change state, record what caused it, and log it to the activity log."""
         self._changed_by = reason
         _LOGGER.debug("lock -> %s  (%s)", state or "unknown", reason)
+        if state != self._logged_state:
+            self._logged_state = state
+            verb = {LOCKED: "locked", UNLOCKED: "unlocked"}.get(state, "state unknown")
+            async_log_entry(
+                self.hass, "ERA Protect Lock", f"{verb} — {reason}",
+                DOMAIN, self.entity_id)
         self._set(state)
 
     # -- auto-relock timer ----------------------------------------------------

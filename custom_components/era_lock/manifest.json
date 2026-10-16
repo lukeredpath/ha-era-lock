@@ -3,6 +3,7 @@
   "name": "ERA Protect Lock",
   "version": "0.1.0",
   "config_flow": true,
+  "after_dependencies": ["logbook"],
   "documentation": "https://github.com/lukeredpath/ha-era-lock",
   "issue_tracker": "https://github.com/lukeredpath/ha-era-lock/issues",
   "codeowners": ["@lukeredpath"],

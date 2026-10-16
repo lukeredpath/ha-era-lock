@@ -79,6 +79,7 @@ class EraMqttListener:
         self._roster = dpmap.roster_from_config(combined)
         self._client: mqtt.Client | None = None
         self._closing = False
+        self._last_state_ts = 0  # guard against stale DP replays on lock wake
 
     # -- lifecycle (start/stop run in an executor thread) --------------------
     def start(self) -> None:
@@ -104,6 +105,17 @@ class EraMqttListener:
         if self._client is not None:
             self._client.loop_stop()
             self._client.disconnect()
+
+    def wake(self) -> None:
+        """Publish the synch DP (dp54) so the lock reconnects and reports its
+        current DPs, without waiting for the next BLE wake. Not an actuation.
+        Use sparingly — waking the BLE lock costs battery.
+        """
+        from .eralock.mqtt import WAKE_DPS
+        if self._client is None:
+            return
+        self._helper._publish(self._client, WAKE_DPS)
+        _LOGGER.debug("ERA MQTT: sent wake/synch (dp54)")
 
     # -- paho callbacks (paho thread) ----------------------------------------
     def _on_connect(self, client, userdata, flags, reason_code, properties) -> None:
@@ -140,6 +152,23 @@ class EraMqttListener:
         if data.get("cid") != self._helper.cid or not isinstance(dps, dict):
             return
 
+        frame_t = obj.get("t", 0)
+        tmap = data.get("t") if isinstance(data.get("t"), dict) else {}
+
+        # dp11 = electronic lock state; true=locked (incl. auto-relock), false=
+        # unlocked. It's delivered when the BLE lock wakes (with each dp's real
+        # event time in data.t), so guard against stale replays by timestamp.
+        if "11" in dps:
+            ts = tmap.get("11", frame_t)
+            if ts >= self._last_state_ts:
+                self._last_state_ts = ts
+                locked = bool(dps["11"])
+                self._dispatch(signal_state, {
+                    "locked": locked,
+                    "method": "auto-relock (device)" if locked else "device",
+                })
+
+        # unlock events (dp61 echo / method dps) -> event + unlocked state
         method: str | None = None
         who: str | None = None
         unlocked = dps.get(UNLOCK_ECHO[0]) == UNLOCK_ECHO[1]  # dp61 "AEkA"
@@ -158,13 +187,9 @@ class EraMqttListener:
                     "method": method, "who": who, "credential_id": cred,
                 })
                 unlocked = True
-        if unlocked:
-            # unlocked -> lock entity sets state + records who/how, starts relock timer
+        if unlocked and frame_t >= self._last_state_ts:
+            self._last_state_ts = frame_t
             self._dispatch(signal_state, {"locked": False, "method": method, "who": who})
-        # NOTE: dp11 ("anti_lock") is intentionally NOT used for state yet — it
-        # bounces during an unlock and the device emits no clean relock signal,
-        # so "locked" is inferred by the lock entity's fallback timer. Raw frames
-        # are debug-logged for the locked-state investigation.
 
     def _dispatch(self, signal_fn, payload) -> None:
         self.hass.loop.call_soon_threadsafe(
