@@ -2,7 +2,18 @@
   "entity": {
     "event": {
       "activity": {
-        "name": "Activity"
+        "name": "Activity",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "unlock": "Unlocked",
+              "lock": "Locked",
+              "failed_unlock": "Failed unlock",
+              "tamper": "Tamper",
+              "door": "Door"
+            }
+          }
+        }
       }
     }
   },

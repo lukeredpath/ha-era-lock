@@ -183,6 +183,12 @@ class EraController:
         actor) is resolved here so the event entity needs no options access."""
         creds = self._options.get(CONF_CREDENTIALS, [])
         label, mapped_uid, user_name = lookup(creds, ev.method, ev.cred)
+        # Only name an actor when there's a real one to name; a plain
+        # lock/failed_unlock/tamper/door carries no credential, so "unknown"
+        # is dropped to None rather than surfaced as a spurious attribute.
+        actor = attr_actor(creds, ev.method, ev.cred, ev.who)
+        if actor == "unknown":
+            actor = None
         async_dispatcher_send(self.hass, signal_event(self.entry_id), {
             "type": etype,
             "dt": ev.dt,
@@ -192,7 +198,7 @@ class EraController:
             "user": user_name,
             "user_id": user_id or mapped_uid,
             "label": label,
-            "actor": attr_actor(creds, ev.method, ev.cred, ev.who),
+            "actor": actor,
             "source": ev.source,
             "subtype": ev.subtype,
             "cause_ctx_id": cause_ctx_id,
