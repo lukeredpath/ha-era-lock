@@ -86,9 +86,10 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
     @property
     def _relock_seconds(self) -> int:
         try:
-            return int(self._options.get(CONF_AUTO_RELOCK_SECONDS, DEFAULT_AUTO_RELOCK_SECONDS))
+            v = int(self._options.get(CONF_AUTO_RELOCK_SECONDS, DEFAULT_AUTO_RELOCK_SECONDS))
         except (TypeError, ValueError):
-            return DEFAULT_AUTO_RELOCK_SECONDS
+            v = DEFAULT_AUTO_RELOCK_SECONDS
+        return max(v, 60)  # failsafe only; the device-poll should capture the real lock first
 
     @property
     def _door_entity(self) -> str | None:
@@ -205,28 +206,34 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
             self._device_debounce = async_call_later(
                 self.hass, DEVICE_DEBOUNCE_S, self._apply_device)
             return
-        # event-driven (an actual unlock) -> apply immediately
+        # event-driven (an actual unlock)
+        self._start_relock()  # (re)start the relock window
+        if self.coordinator.wake is not None:
+            self.coordinator.wake.on_unlock()  # confirm the relock shortly after
+        if self._state == UNLOCKED:
+            return  # already unlocked this cycle; keep the first (cleaner) cause
         self._last_method = method
         self._last_user = who
         reason = (f"Unlocked by {who}" if who
                   else f"Unlocked ({method})" if method else "Unlocked")
         self._transition(UNLOCKED, reason)
-        self._start_relock()
-        if self.coordinator.wake is not None:
-            self.coordinator.wake.on_unlock()  # confirm the relock shortly after
 
     @callback
     def _apply_device(self, _now=None) -> None:
         self._device_debounce = None
         if self._pending_device is None:
             return
-        locked, method = self._pending_device
+        locked, _method = self._pending_device
         self._pending_device = None
+        new = LOCKED if locked else UNLOCKED
+        if new == self._state:
+            return  # device merely confirms the current state; no change
         if locked:
             self._cancel_relock()
+            if self.coordinator.wake is not None:
+                self.coordinator.wake.cancel_polls()  # real lock seen; stop polling
             self._transition(LOCKED, "Auto-lock (device)")
         else:
-            # device-confirmed unlocked is authoritative; don't restart the timer
             self._transition(UNLOCKED, "Unlocked (reported by lock)")
 
     @callback

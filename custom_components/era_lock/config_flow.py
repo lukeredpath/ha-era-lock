@@ -246,7 +246,7 @@ class EraLockOptionsFlow(OptionsFlow):
                 CONF_AUTO_RELOCK_SECONDS,
                 default=o.get(CONF_AUTO_RELOCK_SECONDS, DEFAULT_AUTO_RELOCK_SECONDS),
             ): NumberSelector(NumberSelectorConfig(
-                min=0, max=600, step=1, mode=NumberSelectorMode.BOX,
+                min=60, max=600, step=1, mode=NumberSelectorMode.BOX,
                 unit_of_measurement="s")),
             vol.Optional(
                 CONF_DOOR_CONTACT_ENTITY_ID,

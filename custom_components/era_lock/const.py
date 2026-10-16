@@ -5,9 +5,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "era_lock"
 
-PLATFORMS: list[Platform] = [
-    Platform.LOCK, Platform.SENSOR, Platform.EVENT, Platform.BUTTON,
-]
+PLATFORMS: list[Platform] = [Platform.LOCK, Platform.SENSOR, Platform.BUTTON]
 
 # --- config entry data keys --------------------------------------------------
 CONF_ERA = "era"                       # refresh token + ERA bridge config
@@ -22,5 +20,5 @@ CONF_DOOR_CONTACT_ENTITY_ID = "door_contact_entity_id"
 CONF_WAKE_HEARTBEAT = "wake_heartbeat_seconds"
 
 DEFAULT_SCAN_INTERVAL = 1800          # 30 min local LAN poll (battery is slow)
-DEFAULT_AUTO_RELOCK_SECONDS = 30      # hardware auto-relock window
+DEFAULT_AUTO_RELOCK_SECONDS = 60      # failsafe relock timer (min 60s; device dp11 wins)
 DEFAULT_WAKE_HEARTBEAT = 900          # idle wake interval (0 = off); battery vs latency

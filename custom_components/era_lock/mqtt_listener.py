@@ -36,10 +36,6 @@ _LOGGER = logging.getLogger(__name__)
 STALE_STATE_S = 20
 
 
-def signal_event(entry_id: str) -> str:
-    return f"{DOMAIN}_{entry_id}_event"
-
-
 def signal_state(entry_id: str) -> str:
     return f"{DOMAIN}_{entry_id}_state"
 
@@ -195,9 +191,6 @@ class EraMqttListener:
                 cred = _dp_value(raw)
                 method = dpmap.METHOD_DP_LABELS[dp_id]
                 who = dpmap.attribute(dp_id, cred if cred is not None else 0, self._roster)
-                self._dispatch(signal_event, {
-                    "method": method, "who": who, "credential_id": cred,
-                })
                 unlocked = True
         if unlocked and frame_t >= self._last_state_ts:
             self._last_state_ts = frame_t

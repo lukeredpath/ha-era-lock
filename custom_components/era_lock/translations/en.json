@@ -49,9 +49,9 @@
     "step": {
       "init": {
         "title": "ERA Protect Lock options",
-        "description": "The lock reports no reliable relock signal, so “locked” is inferred this many seconds after an unlock (0 disables). An optional door-contact sensor refines the state (door open ⇒ unlocked).",
+        "description": "After an unlock the lock is polled for its real auto-lock; if that isn't captured, “locked” is assumed after the failsafe window below (min 60s). An optional door-contact sensor refines the state (door open ⇒ unlocked).",
         "data": {
-          "auto_relock_seconds": "Auto-relock window (seconds)",
+          "auto_relock_seconds": "Relock failsafe (seconds, min 60)",
           "door_contact_entity_id": "Door contact sensor (optional)",
           "wake_heartbeat_seconds": "Idle wake interval (seconds, 0 = off)"
         }

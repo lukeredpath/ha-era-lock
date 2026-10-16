@@ -57,7 +57,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: EraConfigEntry) -> bool:
     wake = EraWakeManager(
         hass, listener,
         heartbeat_s=int(entry.options.get(CONF_WAKE_HEARTBEAT, DEFAULT_WAKE_HEARTBEAT)),
-        relock_s=int(entry.options.get(CONF_AUTO_RELOCK_SECONDS, DEFAULT_AUTO_RELOCK_SECONDS)),
     )
     coordinator.wake = wake
     listener.set_wake_manager(wake)
