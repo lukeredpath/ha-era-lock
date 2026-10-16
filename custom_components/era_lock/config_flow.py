@@ -47,7 +47,9 @@ from .const import (
     CONF_SECRETS,
     CONF_SERVICE_CONFIG,
     CONF_SESSION,
+    CONF_WAKE_HEARTBEAT,
     DEFAULT_AUTO_RELOCK_SECONDS,
+    DEFAULT_WAKE_HEARTBEAT,
     DOMAIN,
 )
 from .eralock.era import EraAuthError
@@ -251,5 +253,11 @@ class EraLockOptionsFlow(OptionsFlow):
                 description={"suggested_value": o.get(CONF_DOOR_CONTACT_ENTITY_ID)},
             ): EntitySelector(EntitySelectorConfig(
                 domain="binary_sensor", device_class="door")),
+            vol.Required(
+                CONF_WAKE_HEARTBEAT,
+                default=o.get(CONF_WAKE_HEARTBEAT, DEFAULT_WAKE_HEARTBEAT),
+            ): NumberSelector(NumberSelectorConfig(
+                min=0, max=3600, step=60, mode=NumberSelectorMode.BOX,
+                unit_of_measurement="s")),
         })
         return self.async_show_form(step_id="init", data_schema=schema)

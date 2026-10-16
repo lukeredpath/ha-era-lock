@@ -80,6 +80,10 @@ class EraMqttListener:
         self._client: mqtt.Client | None = None
         self._closing = False
         self._last_state_ts = 0  # guard against stale DP replays on lock wake
+        self._wake_manager = None  # set via set_wake_manager()
+
+    def set_wake_manager(self, wake_manager) -> None:
+        self._wake_manager = wake_manager
 
     # -- lifecycle (start/stop run in an executor thread) --------------------
     def start(self) -> None:
@@ -133,6 +137,8 @@ class EraMqttListener:
             _LOGGER.debug("ERA MQTT disconnected; paho will retry")
 
     def _on_message(self, client, userdata, msg) -> None:
+        if self._wake_manager is not None:
+            self._wake_manager.note_inbound()
         payload = self._helper._decrypt(msg.payload)
         if not payload:
             return

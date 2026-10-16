@@ -19,6 +19,8 @@ CONF_SECRETS = "secrets"               # secret key material (hmac_key, local ke
 CONF_SCAN_INTERVAL = "scan_interval"
 CONF_AUTO_RELOCK_SECONDS = "auto_relock_seconds"
 CONF_DOOR_CONTACT_ENTITY_ID = "door_contact_entity_id"
+CONF_WAKE_HEARTBEAT = "wake_heartbeat_seconds"
 
 DEFAULT_SCAN_INTERVAL = 1800          # 30 min local LAN poll (battery is slow)
 DEFAULT_AUTO_RELOCK_SECONDS = 30      # hardware auto-relock window
+DEFAULT_WAKE_HEARTBEAT = 900          # idle wake interval (0 = off); battery vs latency

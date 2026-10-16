@@ -52,7 +52,8 @@
         "description": "The lock reports no reliable relock signal, so “locked” is inferred this many seconds after an unlock (0 disables). An optional door-contact sensor refines the state (door open ⇒ unlocked).",
         "data": {
           "auto_relock_seconds": "Auto-relock window (seconds)",
-          "door_contact_entity_id": "Door contact sensor (optional)"
+          "door_contact_entity_id": "Door contact sensor (optional)",
+          "wake_heartbeat_seconds": "Idle wake interval (seconds, 0 = off)"
         }
       }
     }

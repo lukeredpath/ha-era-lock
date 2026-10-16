@@ -191,12 +191,16 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
             self._last_user = who
             self._transition(UNLOCKED, who or method or "unlock")
             self._start_relock()
+            if self.coordinator.wake is not None:
+                self.coordinator.wake.on_unlock()  # confirm the relock shortly after
 
     @callback
     def _on_door(self, event: Event) -> None:
         new = event.data.get("new_state")
         if new is None:
             return
+        if self.coordinator.wake is not None:
+            self.coordinator.wake.on_door_change()  # door change -> fetch lock state
         if new.state == "on":  # opened -> can't be deadbolt-locked
             self._cancel_relock()
             self._transition(UNLOCKED, "door opened")

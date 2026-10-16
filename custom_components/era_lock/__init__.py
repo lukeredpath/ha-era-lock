@@ -9,12 +9,23 @@ from __future__ import annotations
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .const import CONF_ERA, CONF_SECRETS, CONF_SERVICE_CONFIG, CONF_SESSION, PLATFORMS
+from .const import (
+    CONF_AUTO_RELOCK_SECONDS,
+    CONF_ERA,
+    CONF_SECRETS,
+    CONF_SERVICE_CONFIG,
+    CONF_SESSION,
+    CONF_WAKE_HEARTBEAT,
+    DEFAULT_AUTO_RELOCK_SECONDS,
+    DEFAULT_WAKE_HEARTBEAT,
+    PLATFORMS,
+)
 from .coordinator import EraLockCoordinator
 from .eralock.secrets import DEFAULTS
 from .eralock.session import Session
 from .mqtt_listener import EraMqttListener
 from .session import EraSessionManager
+from .wake import EraWakeManager
 
 type EraConfigEntry = ConfigEntry[EraLockCoordinator]
 
@@ -42,6 +53,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: EraConfigEntry) -> bool:
     coordinator.listener = listener
     await hass.async_add_executor_job(listener.start)
 
+    # Intelligent wake: pick up buffered events at worthwhile moments.
+    wake = EraWakeManager(
+        hass, listener,
+        heartbeat_s=int(entry.options.get(CONF_WAKE_HEARTBEAT, DEFAULT_WAKE_HEARTBEAT)),
+        relock_s=int(entry.options.get(CONF_AUTO_RELOCK_SECONDS, DEFAULT_AUTO_RELOCK_SECONDS)),
+    )
+    coordinator.wake = wake
+    listener.set_wake_manager(wake)
+    wake.start()
+
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     return True
 
@@ -53,7 +74,9 @@ async def _async_update_listener(hass: HomeAssistant, entry: EraConfigEntry) -> 
 
 async def async_unload_entry(hass: HomeAssistant, entry: EraConfigEntry) -> bool:
     """Unload a config entry."""
-    listener = entry.runtime_data.listener
-    if listener is not None:
-        await hass.async_add_executor_job(listener.stop)
+    coordinator = entry.runtime_data
+    if coordinator.wake is not None:
+        coordinator.wake.stop()
+    if coordinator.listener is not None:
+        await hass.async_add_executor_job(coordinator.listener.stop)
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
