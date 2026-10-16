@@ -16,7 +16,7 @@ from homeassistant.components.logbook import (
 )
 from homeassistant.core import Event, HomeAssistant, callback
 
-from .const import DOMAIN, EVENT_CAUSE
+from .const import CAUSE_SOURCE, DOMAIN, EVENT_CAUSE
 
 
 @callback
@@ -27,7 +27,7 @@ def async_describe_events(
     @callback
     def describe(event: Event) -> dict:
         return {
-            LOGBOOK_ENTRY_NAME: event.data.get("name", "ERA Protect Lock"),
+            LOGBOOK_ENTRY_NAME: event.data.get("name", CAUSE_SOURCE),
             LOGBOOK_ENTRY_MESSAGE: event.data.get("message", ""),
         }
 

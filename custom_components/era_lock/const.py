@@ -8,6 +8,9 @@ DOMAIN = "era_lock"
 # Fired (with a context) as the parent of each lock state change so the activity
 # log's "what happened" shows the cause; described in logbook.py.
 EVENT_CAUSE = "era_lock_cause"
+# Name shown on the cause/annotation logbook rows, kept distinct from the lock
+# entity's own name so the two don't read as the same source.
+CAUSE_SOURCE = "ERA Protect Lock Activity"
 
 PLATFORMS: list[Platform] = [Platform.LOCK, Platform.SENSOR, Platform.BUTTON]
 

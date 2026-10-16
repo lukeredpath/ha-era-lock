@@ -25,6 +25,7 @@ _LOGGER = logging.getLogger(__name__)
 
 MIN_WAKE_GAP = 20.0  # minimum seconds between non-poll forced wakes (battery)
 WAKE_POLL_OFFSETS = (30, 40, 50)  # seconds after an unlock to poll for auto-lock
+POST_CLOSE_SYNC_S = 60  # after a thumbturn-exit close, re-sync to catch a lock-up
 
 
 class EraWakeManager:
@@ -38,6 +39,7 @@ class EraWakeManager:
         self._last_wake = 0.0
         self._heartbeat_unsub = None
         self._poll_unsubs: list = []
+        self._followup_unsub = None
 
     @callback
     def start(self) -> None:
@@ -48,6 +50,7 @@ class EraWakeManager:
     @callback
     def stop(self) -> None:
         self.cancel_polls()
+        self._cancel_followup()
         if self._heartbeat_unsub:
             self._heartbeat_unsub()
             self._heartbeat_unsub = None
@@ -63,9 +66,14 @@ class EraWakeManager:
         lock reports locked."""
         self.cancel_polls()
         for offset in WAKE_POLL_OFFSETS:
-            self._poll_unsubs.append(async_call_later(
-                self.hass, offset,
-                lambda _now, o=offset: self._wake(f"relock poll +{o}s", force=True)))
+            # The scheduled action MUST be a @callback: a plain function makes
+            # async_call_later dispatch it to an executor thread, where _wake's
+            # loop-only async_add_executor_job raises "no running event loop".
+            @callback
+            def _poll(_now, o=offset) -> None:
+                self._wake(f"relock poll +{o}s", force=True)
+
+            self._poll_unsubs.append(async_call_later(self.hass, offset, _poll))
 
     @callback
     def cancel_polls(self) -> None:
@@ -76,6 +84,26 @@ class EraWakeManager:
     @callback
     def on_door_change(self) -> None:
         self._wake("door event")
+
+    @callback
+    def schedule_followup(self, delay: float = POST_CLOSE_SYNC_S) -> None:
+        """Schedule a single delayed wake. Used after a thumbturn-exit door close
+        to catch a lock-up done shortly after the door shut (which the immediate
+        close wake is too early to see)."""
+        self._cancel_followup()
+
+        @callback
+        def _fire(_now) -> None:
+            self._followup_unsub = None
+            self._wake("post-close re-sync", force=True)
+
+        self._followup_unsub = async_call_later(self.hass, delay, _fire)
+
+    @callback
+    def _cancel_followup(self) -> None:
+        if self._followup_unsub is not None:
+            self._followup_unsub()
+            self._followup_unsub = None
 
     @callback
     def request_wake(self, reason: str = "manual") -> None:

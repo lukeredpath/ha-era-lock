@@ -33,6 +33,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import EraConfigEntry
 from .const import (
+    CAUSE_SOURCE,
     CONF_AUTO_RELOCK_SECONDS,
     CONF_DOOR_CONTACT_ENTITY_ID,
     DEFAULT_AUTO_RELOCK_SECONDS,
@@ -78,6 +79,9 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
         self._pending: dict | None = None
         self._device_debounce = None
         self._last_applied_dt: float = 0.0  # device-time of the last applied state
+        self._unlocking: bool = False  # transient "Unlocking…" UI state
+        self._inferred: bool = True  # True until the lock itself confirms a state
+        self._exit_pending: bool = False  # locked->thumbturn-open awaiting a close
 
     # -- options --------------------------------------------------------------
     @property
@@ -125,6 +129,10 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
         return self._state == LOCKED
 
     @property
+    def is_unlocking(self) -> bool:
+        return self._unlocking
+
+    @property
     def changed_by(self) -> str | None:
         """What last changed the lock (shown in the UI + logbook)."""
         return self._changed_by
@@ -133,6 +141,7 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         return {
             "reason": self._changed_by,
+            "inferred": self._inferred,
             "last_unlock_method": self._last_method,
             "last_unlock_by": self._last_user,
         }
@@ -143,16 +152,22 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
         self.async_write_ha_state()
 
     @callback
-    def _transition(self, state: str | None, reason: str) -> None:
+    def _transition(
+        self, state: str | None, reason: str, *, inferred: bool = False
+    ) -> None:
         """Change state; fire a cause event as the change's context parent so the
-        activity log's "what happened" box shows the cause."""
+        activity log's "what happened" box shows the cause. ``inferred`` marks a
+        state HA deduced (door sensor, relock timer, manual assertion) rather than
+        one the lock itself reported."""
         self._changed_by = reason
-        _LOGGER.debug("lock -> %s  (%s)", state or "unknown", reason)
+        self._inferred = inferred
+        _LOGGER.debug("lock -> %s  (%s)%s", state or "unknown", reason,
+                      " [inferred]" if inferred else "")
         if state != self._logged_state:
             self._logged_state = state
             cause = Context()
             self.hass.bus.async_fire(
-                EVENT_CAUSE, {"name": "ERA Protect Lock", "message": reason},
+                EVENT_CAUSE, {"name": CAUSE_SOURCE, "message": reason},
                 context=cause)
             self.async_set_context(Context(parent_id=cause.id))
         self._set(state)
@@ -183,7 +198,7 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
         if self._door_open():
             return  # door-open suppresses the timed relock
         self._last_applied_dt = time.time()
-        self._transition(LOCKED, "Auto-lock (timer)")
+        self._transition(LOCKED, "Auto-lock (timer)", inferred=True)
 
     def _door_open(self) -> bool:
         if not self._door_entity:
@@ -244,7 +259,7 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
                           else f"Unlocked ({method})" if method else "Unlocked")
             else:
                 self._cancel_relock()
-                reason = "Auto-lock (device)"
+                reason = "Device Locked"
         else:
             # buffered history: sync to the lock's real final state, don't replay
             if new == LOCKED:
@@ -262,10 +277,31 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
         self._last_applied_dt = time.time()
         if new.state == "on":  # opened -> can't be deadbolt-locked
             self._cancel_relock()
-            self._transition(UNLOCKED, "Door opened")
-        elif new.state == "off":  # closed -> silent relock is unknowable
+            if self._state == LOCKED:
+                # The deadbolt can't be thrown while the door opens, so opening
+                # from a locked state means the internal thumbturn was used to
+                # unlock — the one manual path the lock reports no DP for.
+                self._last_method = "thumbturn"
+                self._last_user = None
+                self._exit_pending = True  # arm the post-close re-sync
+                self._transition(UNLOCKED, "Unlocked (thumbturn)", inferred=True)
+            else:
+                self._exit_pending = False
+                self._transition(UNLOCKED, "Door opened", inferred=True)
+        elif new.state == "off":  # closed: closing can't throw the deadbolt, so
+            # assume the lock stays unlocked; a genuine handle-lift re-lock
+            # arrives as dp11 on the wake this close triggers. Don't clobber a
+            # more specific unlock reason (e.g. thumbturn) already set.
             self._cancel_relock()
-            self._transition(None, "Door closed")
+            if self._state != UNLOCKED:
+                self._transition(UNLOCKED, "Door closed", inferred=True)
+            if self._exit_pending:
+                # locked -> thumbturn-open -> close: somebody likely left, and a
+                # lock-up tends to happen in the first minute. Re-sync then to
+                # catch it (the immediate close wake fires too early to see it).
+                self._exit_pending = False
+                if self.coordinator.wake is not None:
+                    self.coordinator.wake.schedule_followup()
 
     # -- commands -------------------------------------------------------------
     async def async_lock(self, **kwargs: Any) -> None:
@@ -274,15 +310,30 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
         # thumbturn doesn't report.
         self._cancel_relock()
         self._last_applied_dt = time.time()
-        self._transition(LOCKED, "Locked in Home Assistant")
+        self._transition(LOCKED, "Locked in Home Assistant", inferred=True)
 
     async def async_unlock(self, **kwargs: Any) -> None:
-        await self.hass.async_add_executor_job(self._unlock)
+        # Show the transitioning ("Unlocking…") state immediately; the cloud
+        # round-trip takes a second or two.
+        self._unlocking = True
+        self.async_write_ha_state()
+        try:
+            await self.hass.async_add_executor_job(self._unlock)
+        except Exception:
+            self._unlocking = False
+            self.async_write_ha_state()
+            raise
+        self._unlocking = False
         self._last_method = "remote"
         self._last_user = "Home Assistant"
         self._last_applied_dt = time.time()
         self._transition(UNLOCKED, "Unlocked in Home Assistant")
         self._start_relock()
+        # Poll for the lock's own auto-lock (dp11) before the failsafe timer; we
+        # know we unlocked, so arm the polls here rather than waiting on an
+        # inbound unlock event (an HA unlock only echoes a bare dp11:false).
+        if self.coordinator.wake is not None:
+            self.coordinator.wake.on_unlock()
         await self.coordinator.async_request_refresh()
 
     def _unlock(self) -> None:
