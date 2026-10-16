@@ -25,6 +25,11 @@ CONF_SCAN_INTERVAL = "scan_interval"
 CONF_AUTO_RELOCK_SECONDS = "auto_relock_seconds"
 CONF_DOOR_CONTACT_ENTITY_ID = "door_contact_entity_id"
 CONF_WAKE_HEARTBEAT = "wake_heartbeat_seconds"
+CONF_CREDENTIALS = "credentials"  # [{method, id, label, user_id?, user_name?}]
+
+# Physical credential methods a user can label / map to an HA user. Values match
+# dpmap.METHOD_DP_LABELS so a label resolves against inbound unlock events.
+CREDENTIAL_METHODS = ("fingerprint", "card", "ble")
 
 DEFAULT_SCAN_INTERVAL = 1800          # 30 min local LAN poll (battery is slow)
 DEFAULT_AUTO_RELOCK_SECONDS = 60      # failsafe relock timer (min 60s; device dp11 wins)

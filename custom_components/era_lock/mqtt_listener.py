@@ -176,6 +176,7 @@ class EraMqttListener:
         # unlock events (dp61 echo / method dps)
         method: str | None = None
         who: str | None = None
+        cred_id: int | None = None
         unlock_dt = frame_t
         unlocked = dps.get(UNLOCK_ECHO[0]) == UNLOCK_ECHO[1]  # dp61 "AEkA"
         if unlocked:
@@ -186,16 +187,17 @@ class EraMqttListener:
             except (TypeError, ValueError):
                 continue
             if dp_id in dpmap.METHOD_DP_LABELS:
-                cred = _dp_value(raw)
+                cred_id = _dp_value(raw)
                 method = dpmap.METHOD_DP_LABELS[dp_id]
-                who = dpmap.attribute(dp_id, cred if cred is not None else 0, self._roster)
+                who = dpmap.attribute(dp_id, cred_id if cred_id is not None else 0,
+                                      self._roster)
                 unlock_dt = tmap.get(str(dp_id), frame_t)
                 unlocked = True
         if unlocked:
             fresh = (frame_t - unlock_dt) <= FRESH_WINDOW
             self._dispatch(signal_state, {
                 "locked": False, "source": "event", "dt": unlock_dt, "fresh": fresh,
-                "method": method, "who": who})
+                "method": method, "who": who, "cred": cred_id})
 
     def _dispatch(self, signal_fn, payload) -> None:
         self.hass.loop.call_soon_threadsafe(

@@ -35,6 +35,7 @@ from . import EraConfigEntry
 from .const import (
     CAUSE_SOURCE,
     CONF_AUTO_RELOCK_SECONDS,
+    CONF_CREDENTIALS,
     CONF_DOOR_CONTACT_ENTITY_ID,
     DEFAULT_AUTO_RELOCK_SECONDS,
     EVENT_CAUSE,
@@ -49,6 +50,13 @@ _LOGGER = logging.getLogger(__name__)
 LOCKED = "locked"
 UNLOCKED = "unlocked"
 DEVICE_DEBOUNCE_S = 2.0  # coalesce dp11 mini-history bursts into one transition
+
+
+def _as_int(v) -> int | None:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
 
 
 async def async_setup_entry(
@@ -153,23 +161,25 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
 
     @callback
     def _transition(
-        self, state: str | None, reason: str, *, inferred: bool = False
+        self, state: str | None, reason: str, *, inferred: bool = False,
+        user_id: str | None = None,
     ) -> None:
         """Change state; fire a cause event as the change's context parent so the
         activity log's "what happened" box shows the cause. ``inferred`` marks a
         state HA deduced (door sensor, relock timer, manual assertion) rather than
-        one the lock itself reported."""
+        one the lock itself reported. ``user_id`` attributes the change to an HA
+        user (so the log shows "By <user>"), e.g. a credential mapped to a user."""
         self._changed_by = reason
         self._inferred = inferred
         _LOGGER.debug("lock -> %s  (%s)%s", state or "unknown", reason,
                       " [inferred]" if inferred else "")
         if state != self._logged_state:
             self._logged_state = state
-            cause = Context()
+            cause = Context(user_id=user_id)
             self.hass.bus.async_fire(
                 EVENT_CAUSE, {"name": CAUSE_SOURCE, "message": reason},
                 context=cause)
-            self.async_set_context(Context(parent_id=cause.id))
+            self.async_set_context(Context(user_id=user_id, parent_id=cause.id))
         self._set(state)
 
     # -- auto-relock timer ----------------------------------------------------
@@ -250,13 +260,13 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
         new = LOCKED if p.get("locked") else UNLOCKED
         if new == self._state:
             return  # no actual change
+        user_id: str | None = None
         if p.get("fresh"):
             if new == UNLOCKED:
+                reason, display, user_id = self._attribute_unlock(
+                    p.get("method"), p.get("cred"), p.get("who"))
                 self._last_method = p.get("method")
-                self._last_user = p.get("who")
-                who, method = p.get("who"), p.get("method")
-                reason = (f"Unlocked by {who}" if who
-                          else f"Unlocked ({method})" if method else "Unlocked")
+                self._last_user = display
             else:
                 self._cancel_relock()
                 reason = "Device Locked"
@@ -265,7 +275,34 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
             if new == LOCKED:
                 self._cancel_relock()
             reason = f"Synced from lock: {'locked' if new == LOCKED else 'unlocked'}"
-        self._transition(new, reason)
+        self._transition(new, reason, user_id=user_id)
+
+    def _attribute_unlock(
+        self, method: str | None, cred, who: str | None
+    ) -> tuple[str, str | None, str | None]:
+        """Resolve an unlock credential to (reason, display_user, user_id).
+
+        Priority: an options-configured credential — mapped HA user, else its
+        custom label — then the frida roster name (``who``), then the raw
+        method+id. When a credential maps to an HA user, ``user_id`` is returned
+        so the state change is attributed to them ("By <user>") with the method.
+        """
+        cred_i = _as_int(cred)
+        if method and cred_i is not None:
+            for c in self._options.get(CONF_CREDENTIALS, []):
+                if c.get("method") == method and _as_int(c.get("id")) == cred_i:
+                    uid = c.get("user_id") or None
+                    if uid:
+                        name = c.get("user_name") or "a Home Assistant user"
+                        return f"Unlocked ({method})", name, uid
+                    label = (c.get("label") or "").strip() or f"{method} #{cred_i}"
+                    return f"Unlocked by {label} ({method})", label, None
+        if who:
+            return f"Unlocked by {who}", who, None
+        if method:
+            tag = f"{method} #{cred_i}" if cred_i is not None else method
+            return f"Unlocked ({tag})", None, None
+        return "Unlocked", None, None
 
     @callback
     def _on_door(self, event: Event) -> None:
@@ -304,19 +341,30 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
                     self.coordinator.wake.schedule_followup()
 
     # -- commands -------------------------------------------------------------
+    async def _caller(self) -> tuple[str | None, str | None]:
+        """The HA user behind the current service call (HA sets it as the entity
+        context before the command runs), resolved to (user_id, name)."""
+        uid = self._context.user_id if self._context else None
+        if not uid:
+            return None, None
+        user = await self.hass.auth.async_get_user(uid)
+        return uid, (user.name if user else None)
+
     async def async_lock(self, **kwargs: Any) -> None:
         # No hardware lock command (the lock auto-relocks), so this is a manual
         # "mark as locked" to assert the secured state the silent mechanical
         # thumbturn doesn't report.
         self._cancel_relock()
         self._last_applied_dt = time.time()
-        self._transition(LOCKED, "Locked in Home Assistant", inferred=True)
+        uid, _ = await self._caller()
+        self._transition(LOCKED, "Locked in Home Assistant", inferred=True, user_id=uid)
 
     async def async_unlock(self, **kwargs: Any) -> None:
         # Show the transitioning ("Unlocking…") state immediately; the cloud
         # round-trip takes a second or two.
         self._unlocking = True
         self.async_write_ha_state()
+        uid, name = await self._caller()
         try:
             await self.hass.async_add_executor_job(self._unlock)
         except Exception:
@@ -325,9 +373,9 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
             raise
         self._unlocking = False
         self._last_method = "remote"
-        self._last_user = "Home Assistant"
+        self._last_user = name or "Home Assistant"
         self._last_applied_dt = time.time()
-        self._transition(UNLOCKED, "Unlocked in Home Assistant")
+        self._transition(UNLOCKED, "Unlocked in Home Assistant", user_id=uid)
         self._start_relock()
         # Poll for the lock's own auto-lock (dp11) before the failsafe timer; we
         # know we unlocked, so arm the polls here rather than waiting on an

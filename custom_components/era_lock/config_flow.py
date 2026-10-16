@@ -42,12 +42,14 @@ from homeassistant.helpers.selector import (
 
 from .const import (
     CONF_AUTO_RELOCK_SECONDS,
+    CONF_CREDENTIALS,
     CONF_DOOR_CONTACT_ENTITY_ID,
     CONF_ERA,
     CONF_SECRETS,
     CONF_SERVICE_CONFIG,
     CONF_SESSION,
     CONF_WAKE_HEARTBEAT,
+    CREDENTIAL_METHODS,
     DEFAULT_AUTO_RELOCK_SECONDS,
     DEFAULT_WAKE_HEARTBEAT,
     DOMAIN,
@@ -230,14 +232,55 @@ class EraLockConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
 
+_ADD_CREDENTIAL = "__add__"
+_NO_USER = "__none__"
+
+
+def _as_int(v: Any) -> int | None:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _credential_summary(c: dict) -> str:
+    base = f"{c.get('method', '?')} #{c.get('id', '?')}"
+    who = c.get("user_name") or (c.get("label") or "").strip()
+    return f"{base} — {who}" if who else base
+
+
 class EraLockOptionsFlow(OptionsFlow):
-    """Tuning options: the auto-relock window and an optional door contact."""
+    """Tuning options (relock window, door contact, heartbeat) plus per-credential
+    labels and optional HA-user mapping for fingerprint/card attribution."""
+
+    def __init__(self) -> None:
+        self._edit_index: int | None = None
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
+        return self.async_show_menu(
+            step_id="init", menu_options=["settings", "credentials"])
+
+    def _save(self, update: dict[str, Any]) -> ConfigFlowResult:
+        """Merge an update into the existing options (never replace the lot)."""
+        data = dict(self.config_entry.options)
+        data.update(update)
+        return self.async_create_entry(title="", data=data)
+
+    # -- lock settings --------------------------------------------------------
+    async def async_step_settings(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         if user_input is not None:
-            data = {k: v for k, v in user_input.items() if v not in (None, "")}
+            cleaned = {k: v for k, v in user_input.items() if v not in (None, "")}
+            data = dict(self.config_entry.options)
+            for k in (CONF_AUTO_RELOCK_SECONDS, CONF_DOOR_CONTACT_ENTITY_ID,
+                      CONF_WAKE_HEARTBEAT):
+                if k in cleaned:
+                    data[k] = cleaned[k]
+                else:
+                    data.pop(k, None)  # optional field cleared
             return self.async_create_entry(title="", data=data)
 
         o = self.config_entry.options
@@ -260,4 +303,79 @@ class EraLockOptionsFlow(OptionsFlow):
                 min=0, max=3600, step=60, mode=NumberSelectorMode.BOX,
                 unit_of_measurement="s")),
         })
-        return self.async_show_form(step_id="init", data_schema=schema)
+        return self.async_show_form(step_id="settings", data_schema=schema)
+
+    # -- credentials: pick one to edit, or add ---------------------------------
+    async def async_step_credentials(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        creds = list(self.config_entry.options.get(CONF_CREDENTIALS, []))
+        if user_input is not None:
+            sel = user_input["credential"]
+            self._edit_index = None if sel == _ADD_CREDENTIAL else int(sel)
+            return await self.async_step_credential()
+        choices = {_ADD_CREDENTIAL: "➕ Add a credential"}
+        for i, c in enumerate(creds):
+            choices[str(i)] = _credential_summary(c)
+        return self.async_show_form(
+            step_id="credentials",
+            data_schema=vol.Schema({vol.Required("credential"): vol.In(choices)}))
+
+    # -- credentials: add / edit / delete one ----------------------------------
+    async def async_step_credential(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        creds = list(self.config_entry.options.get(CONF_CREDENTIALS, []))
+        existing = creds[self._edit_index] if self._edit_index is not None else {}
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            if user_input.get("delete") and self._edit_index is not None:
+                creds.pop(self._edit_index)
+                return self._save({CONF_CREDENTIALS: creds})
+            cred_id = _as_int(user_input.get("id"))
+            if cred_id is None:
+                errors["base"] = "invalid_id"
+            else:
+                entry: dict[str, Any] = {
+                    "method": user_input["method"],
+                    "id": cred_id,
+                    "label": (user_input.get("label") or "").strip(),
+                }
+                uid = user_input.get("user_id")
+                if uid and uid != _NO_USER:
+                    entry["user_id"] = uid
+                    u = await self.hass.auth.async_get_user(uid)
+                    if u is not None:
+                        entry["user_name"] = u.name
+                if self._edit_index is not None:
+                    creds[self._edit_index] = entry
+                else:
+                    creds.append(entry)
+                return self._save({CONF_CREDENTIALS: creds})
+
+        users = await self.hass.auth.async_get_users()
+        user_choices = {_NO_USER: "— No HA user (use label) —"}
+        for u in users:
+            if u.is_active and not u.system_generated and u.name:
+                user_choices[u.id] = u.name
+
+        fields: dict[Any, Any] = {
+            vol.Required(
+                "method", default=existing.get("method", CREDENTIAL_METHODS[0]),
+            ): vol.In(list(CREDENTIAL_METHODS)),
+            vol.Required(
+                "id", default=existing.get("id", 1),
+            ): NumberSelector(NumberSelectorConfig(
+                min=0, max=255, step=1, mode=NumberSelectorMode.BOX)),
+            vol.Optional(
+                "label", description={"suggested_value": existing.get("label")},
+            ): _TEXT,
+            vol.Optional(
+                "user_id", default=existing.get("user_id", _NO_USER),
+            ): vol.In(user_choices),
+        }
+        if self._edit_index is not None:
+            fields[vol.Optional("delete", default=False)] = bool
+        return self.async_show_form(
+            step_id="credential", data_schema=vol.Schema(fields), errors=errors)
