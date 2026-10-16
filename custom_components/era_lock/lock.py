@@ -68,6 +68,9 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
         self._attr_device_info = device_info(entry)
         self._state: str | None = None
         self._relock_cancel = None
+        self._changed_by: str | None = None
+        self._last_method: str | None = None
+        self._last_user: str | None = None
 
     # -- options --------------------------------------------------------------
     @property
@@ -112,10 +115,30 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
             return None
         return self._state == LOCKED
 
+    @property
+    def changed_by(self) -> str | None:
+        """What last changed the lock (shown in the UI + logbook)."""
+        return self._changed_by
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "reason": self._changed_by,
+            "last_unlock_method": self._last_method,
+            "last_unlock_by": self._last_user,
+        }
+
     @callback
     def _set(self, state: str | None) -> None:
         self._state = state
         self.async_write_ha_state()
+
+    @callback
+    def _transition(self, state: str | None, reason: str) -> None:
+        """Change state and record what caused it."""
+        self._changed_by = reason
+        _LOGGER.debug("lock -> %s  (%s)", state or "unknown", reason)
+        self._set(state)
 
     # -- auto-relock timer ----------------------------------------------------
     @callback
@@ -136,7 +159,7 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
         self._relock_cancel = None
         if self._door_open():
             return  # door-open suppresses the timed relock
-        self._set(LOCKED)
+        self._transition(LOCKED, "auto-relock (timer)")
 
     def _door_open(self) -> bool:
         if not self._door_entity:
@@ -146,12 +169,18 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
 
     # -- inputs ---------------------------------------------------------------
     @callback
-    def _on_push_state(self, locked: bool) -> None:
+    def _on_push_state(self, payload) -> None:
+        # payload is {"locked": bool, "method": str|None, "who": str|None}
+        locked = payload.get("locked") if isinstance(payload, dict) else bool(payload)
+        method = payload.get("method") if isinstance(payload, dict) else None
+        who = payload.get("who") if isinstance(payload, dict) else None
         if locked:
             self._cancel_relock()
-            self._set(LOCKED)
+            self._transition(LOCKED, method or "event")
         else:
-            self._set(UNLOCKED)
+            self._last_method = method
+            self._last_user = who
+            self._transition(UNLOCKED, who or method or "unlock")
             self._start_relock()
 
     @callback
@@ -161,10 +190,10 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
             return
         if new.state == "on":  # opened -> can't be deadbolt-locked
             self._cancel_relock()
-            self._set(UNLOCKED)
+            self._transition(UNLOCKED, "door opened")
         elif new.state == "off":  # closed -> silent relock is unknowable
             self._cancel_relock()
-            self._set(None)
+            self._transition(None, "door closed")
 
     # -- commands -------------------------------------------------------------
     async def async_lock(self, **kwargs: Any) -> None:
@@ -172,11 +201,13 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
         # "mark as locked" to assert the secured state the silent mechanical
         # thumbturn doesn't report.
         self._cancel_relock()
-        self._set(LOCKED)
+        self._transition(LOCKED, "Home Assistant (manual)")
 
     async def async_unlock(self, **kwargs: Any) -> None:
         await self.hass.async_add_executor_job(self._unlock)
-        self._set(UNLOCKED)
+        self._last_method = "remote"
+        self._last_user = "Home Assistant"
+        self._transition(UNLOCKED, "Home Assistant (manual)")
         self._start_relock()
         await self.coordinator.async_request_refresh()
 

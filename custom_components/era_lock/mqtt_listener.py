@@ -140,7 +140,11 @@ class EraMqttListener:
         if data.get("cid") != self._helper.cid or not isinstance(dps, dict):
             return
 
+        method: str | None = None
+        who: str | None = None
         unlocked = dps.get(UNLOCK_ECHO[0]) == UNLOCK_ECHO[1]  # dp61 "AEkA"
+        if unlocked:
+            method = "remote"
         for dp, raw in dps.items():
             try:
                 dp_id = int(dp)
@@ -148,15 +152,15 @@ class EraMqttListener:
                 continue
             if dp_id in dpmap.METHOD_DP_LABELS:
                 cred = _dp_value(raw)
+                method = dpmap.METHOD_DP_LABELS[dp_id]
+                who = dpmap.attribute(dp_id, cred if cred is not None else 0, self._roster)
                 self._dispatch(signal_event, {
-                    "method": dpmap.METHOD_DP_LABELS[dp_id],
-                    "who": dpmap.attribute(dp_id, cred if cred is not None else 0,
-                                           self._roster),
-                    "credential_id": cred,
+                    "method": method, "who": who, "credential_id": cred,
                 })
                 unlocked = True
         if unlocked:
-            self._dispatch(signal_state, False)  # unlocked -> lock entity starts relock timer
+            # unlocked -> lock entity sets state + records who/how, starts relock timer
+            self._dispatch(signal_state, {"locked": False, "method": method, "who": who})
         # NOTE: dp11 ("anti_lock") is intentionally NOT used for state yet — it
         # bounces during an unlock and the device emits no clean relock signal,
         # so "locked" is inferred by the lock entity's fallback timer. Raw frames
