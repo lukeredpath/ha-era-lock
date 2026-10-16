@@ -1,15 +1,9 @@
-"""Lock entity for the ERA Protect Lock.
+"""Lock entity (Layer 3) for the ERA Protect Lock.
 
-Cloud-assisted unlock over Tuya MQTT (the proven path). The hardware reports no
-authoritative lock state and relocks automatically, so state is inferred:
-
-  - unlock (push event / command) -> `unlocked`, start the auto-relock timer;
-  - timer elapses with the door still shut -> `locked`;
-  - an optional door-contact sensor corrects the silent mechanical path: the
-    door cannot open while deadbolt-locked, so a door **open** means `unlocked`
-    (this catches a manual thumbturn), and after the door **closes** the state
-    is `unknown` (a silent manual relock is unknowable) until the next event;
-  - `lock()` is a manual "mark as locked" so the user can resolve `unknown`.
+A thin projection of the controller's state model. The hardware reports no
+authoritative lock state and relocks automatically, so state is inferred by the
+controller (see controller.py); this entity only renders ``signal_state`` updates
+and delegates lock/unlock commands to the controller.
 
 `assumed_state` is set, and the entity stays available without the local LAN
 poll (unlock rides cloud MQTT).
@@ -17,49 +11,21 @@ poll (unlock rides cloud MQTT).
 from __future__ import annotations
 
 import logging
-import time
 from typing import Any
 
-from homeassistant.components import persistent_notification
 from homeassistant.components.lock import LockEntity
-from homeassistant.core import Context, Event, HomeAssistant, callback
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.core import Context, HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.event import (
-    async_call_later,
-    async_track_state_change_event,
-)
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import EraConfigEntry
-from .const import (
-    CAUSE_SOURCE,
-    CONF_AUTO_RELOCK_SECONDS,
-    CONF_CREDENTIALS,
-    CONF_DOOR_CONTACT_ENTITY_ID,
-    CREDENTIAL_METHODS,
-    DEFAULT_AUTO_RELOCK_SECONDS,
-    DOMAIN,
-    EVENT_CAUSE,
-)
+from .controller import LOCKED, EraController
 from .coordinator import EraLockCoordinator
 from .entity import device_info
-from .eralock.mqtt import CloudMqttLock, MqttUnlockError
-from .mqtt_listener import signal_state
+from .events import signal_state
 
 _LOGGER = logging.getLogger(__name__)
-
-LOCKED = "locked"
-UNLOCKED = "unlocked"
-DEVICE_DEBOUNCE_S = 2.0  # coalesce dp11 mini-history bursts into one transition
-
-
-def _as_int(v) -> int | None:
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return None
 
 
 async def async_setup_entry(
@@ -70,7 +36,7 @@ async def async_setup_entry(
 
 
 class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
-    """The door lock, with best-effort inferred state."""
+    """The door lock, rendering the controller's best-effort inferred state."""
 
     _attr_has_entity_name = True
     _attr_name = None  # main entity -> uses the device name
@@ -82,51 +48,23 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
         self._attr_unique_id = f"{entry.unique_id}_lock"
         self._attr_device_info = device_info(entry)
         self._state: str | None = None
-        self._relock_cancel = None
         self._changed_by: str | None = None
+        self._inferred: bool = True
         self._last_method: str | None = None
         self._last_user: str | None = None
-        self._logged_state: str | None = "__init__"  # for logbook de-dupe
-        self._pending: dict | None = None
-        self._device_debounce = None
-        self._last_applied_dt: float = 0.0  # device-time of the last applied state
-        self._unlocking: bool = False  # transient "Unlocking…" UI state
-        self._inferred: bool = True  # True until the lock itself confirms a state
-        self._exit_pending: bool = False  # locked->thumbturn-open awaiting a close
-
-    # -- options --------------------------------------------------------------
-    @property
-    def _options(self) -> dict:
-        return dict(self.coordinator.config_entry.options)
+        self._unlocking: bool = False  # transient "Unlocking…" UI state (local)
 
     @property
-    def _relock_seconds(self) -> int:
-        try:
-            v = int(self._options.get(CONF_AUTO_RELOCK_SECONDS, DEFAULT_AUTO_RELOCK_SECONDS))
-        except (TypeError, ValueError):
-            v = DEFAULT_AUTO_RELOCK_SECONDS
-        return max(v, 60)  # failsafe only; the device-poll should capture the real lock first
-
-    @property
-    def _door_entity(self) -> str | None:
-        return self._options.get(CONF_DOOR_CONTACT_ENTITY_ID)
+    def _controller(self) -> EraController:
+        return self.coordinator.controller
 
     # -- lifecycle ------------------------------------------------------------
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
-        # State starts unknown until an unlock event (dp11 is too ambiguous to
-        # seed from); the fallback relock timer + mark-as-locked resolve it.
         self.async_on_remove(
             async_dispatcher_connect(
-                self.hass, signal_state(self._entry_id), self._on_push_state)
+                self.hass, signal_state(self._entry_id), self._on_state)
         )
-        if self._door_entity:
-            self.async_on_remove(
-                async_track_state_change_event(
-                    self.hass, [self._door_entity], self._on_door)
-            )
-        self.async_on_remove(self._cancel_relock)
-        self.async_on_remove(self._cancel_device_debounce)
 
     @property
     def available(self) -> bool:
@@ -157,228 +95,24 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
             "last_unlock_by": self._last_user,
         }
 
+    # -- state projection -----------------------------------------------------
     @callback
-    def _set(self, state: str | None) -> None:
-        self._state = state
-        self.async_write_ha_state()
-
-    @callback
-    def _transition(
-        self, state: str | None, reason: str, *, inferred: bool = False,
-        user_id: str | None = None,
-    ) -> None:
-        """Change state; fire a cause event as the change's context parent so the
-        activity log's "what happened" box shows the cause. ``inferred`` marks a
-        state HA deduced (door sensor, relock timer, manual assertion) rather than
-        one the lock itself reported. ``user_id`` attributes the change to an HA
-        user (so the log shows "By <user>"), e.g. a credential mapped to a user."""
-        self._changed_by = reason
-        self._inferred = inferred
-        _LOGGER.debug("lock -> %s  (%s)%s", state or "unknown", reason,
-                      " [inferred]" if inferred else "")
-        if state != self._logged_state:
-            self._logged_state = state
-            cause = Context(user_id=user_id)
-            self.hass.bus.async_fire(
-                EVENT_CAUSE, {"name": CAUSE_SOURCE, "message": reason},
-                context=cause)
-            self.async_set_context(Context(user_id=user_id, parent_id=cause.id))
-        self._set(state)
-
-    # -- auto-relock timer ----------------------------------------------------
-    @callback
-    def _start_relock(self) -> None:
-        self._cancel_relock()
-        if self._relock_seconds > 0:
-            self._relock_cancel = async_call_later(
-                self.hass, self._relock_seconds, self._relock_fired)
-
-    @callback
-    def _cancel_relock(self) -> None:
-        if self._relock_cancel is not None:
-            self._relock_cancel()
-            self._relock_cancel = None
-
-    @callback
-    def _cancel_device_debounce(self) -> None:
-        if self._device_debounce is not None:
-            self._device_debounce()
-            self._device_debounce = None
-
-    @callback
-    def _relock_fired(self, _now) -> None:
-        self._relock_cancel = None
-        if self._door_open():
-            return  # door-open suppresses the timed relock
-        self._last_applied_dt = time.time()
-        self._transition(LOCKED, "Auto-lock (timer)", inferred=True)
-
-    def _door_open(self) -> bool:
-        if not self._door_entity:
-            return False
-        st = self.hass.states.get(self._door_entity)
-        return st is not None and st.state == "on"  # door device_class: on=open
-
-    # -- inputs ---------------------------------------------------------------
-    @callback
-    def _on_push_state(self, payload) -> None:
+    def _on_state(self, payload) -> None:
         if not isinstance(payload, dict):
             return
-        source = payload.get("source")
-        method = payload.get("method")
-        who = payload.get("who")
-        dt = payload.get("dt", 0)
-        fresh = payload.get("fresh", True)
-        locked = payload.get("locked")
-
-        # Auto-discover a newly-seen fingerprint/card id (fresh or buffered), so
-        # the user only has to label it. Runs before the ordering guard so even a
-        # superseded flush event registers its credential.
-        if source == "event" and method in CREDENTIAL_METHODS:
-            self._maybe_discover_credential(method, payload.get("cred"))
-
-        # Immediate side-effects for FRESH (live) events only.
-        if fresh:
-            if source == "event" and not locked:
-                self._start_relock()  # (re)start the failsafe window
-                if self.coordinator.wake is not None:
-                    self.coordinator.wake.on_unlock()  # poll for the real auto-lock
-            elif source == "device" and locked:
-                self._cancel_relock()
-                if self.coordinator.wake is not None:
-                    self.coordinator.wake.cancel_polls()  # real lock seen; stop polling
-
-        # Ordered + debounced state application: the latest device-time wins, so a
-        # buffered flush settles on the lock's real final state (no flicker, and
-        # stale replays don't fire live side-effects or replay old causes).
-        if dt <= self._last_applied_dt:
-            return
-        self._last_applied_dt = dt
-        self._pending = payload
-        if self._device_debounce is not None:
-            self._device_debounce()
-        self._device_debounce = async_call_later(self.hass, DEVICE_DEBOUNCE_S, self._apply)
-
-    @callback
-    def _apply(self, _now=None) -> None:
-        self._device_debounce = None
-        p = self._pending
-        if p is None:
-            return
-        self._pending = None
-        new = LOCKED if p.get("locked") else UNLOCKED
-        if new == self._state:
-            return  # no actual change
-        user_id: str | None = None
-        if p.get("fresh"):
-            if new == UNLOCKED:
-                reason, display, user_id = self._attribute_unlock(
-                    p.get("method"), p.get("cred"), p.get("who"))
-                self._last_method = p.get("method")
-                self._last_user = display
-            else:
-                self._cancel_relock()
-                reason = "Device Locked"
-        else:
-            # buffered history: sync to the lock's real final state, don't replay
-            if new == LOCKED:
-                self._cancel_relock()
-            reason = f"Synced from lock: {'locked' if new == LOCKED else 'unlocked'}"
-        self._transition(new, reason, user_id=user_id)
-
-    def _attribute_unlock(
-        self, method: str | None, cred, who: str | None
-    ) -> tuple[str, str | None, str | None]:
-        """Resolve an unlock credential to (reason, display_user, user_id).
-
-        Priority: an options-configured credential — mapped HA user, else its
-        custom label — then the frida roster name (``who``), then the raw
-        method+id. When a credential maps to an HA user, ``user_id`` is returned
-        so the state change is attributed to them ("By <user>") with the method.
-        """
-        cred_i = _as_int(cred)
-        if method and cred_i is not None:
-            for c in self._options.get(CONF_CREDENTIALS, []):
-                if c.get("method") == method and _as_int(c.get("id")) == cred_i:
-                    uid = c.get("user_id") or None
-                    label = (c.get("label") or "").strip()
-                    if uid:
-                        name = c.get("user_name") or "a Home Assistant user"
-                        return f"Unlocked by {name} ({method})", name, uid
-                    if label:
-                        return f"Unlocked by {label} ({method})", label, None
-                    break  # auto-discovered but not yet labelled -> raw fallback
-        if who:
-            return f"Unlocked by {who}", who, None
-        if method:
-            tag = f"{method} #{cred_i}" if cred_i is not None else method
-            return f"Unlocked ({tag})", None, None
-        return "Unlocked", None, None
-
-    @callback
-    def _maybe_discover_credential(self, method: str, cred) -> None:
-        """Auto-add a newly-seen credential id to the roster (blank label) and
-        raise a persistent notification, so the user only has to fill in the
-        label and (optionally) map it to an HA user. Credentials-only option
-        writes don't reload the entry (see __init__._async_update_listener)."""
-        cred_i = _as_int(cred)
-        if cred_i is None:
-            return
-        entry = self.coordinator.config_entry
-        creds = list(entry.options.get(CONF_CREDENTIALS, []))
-        if any(c.get("method") == method and _as_int(c.get("id")) == cred_i
-               for c in creds):
-            return  # already known
-        creds.append({"method": method, "id": cred_i, "label": ""})
-        self.hass.config_entries.async_update_entry(
-            entry, options={**entry.options, CONF_CREDENTIALS: creds})
-        _LOGGER.info("Discovered new %s credential #%s", method, cred_i)
-        persistent_notification.async_create(
-            self.hass,
-            f"A new **{method}** credential (#{cred_i}) just unlocked the ERA "
-            f"Protect Lock. Add a label and (optionally) map it to a Home "
-            f"Assistant user in the integration's options "
-            f"(Settings → Devices & Services → ERA Protect Lock → Configure → "
-            f"Unlock credentials).",
-            title="New lock credential detected",
-            notification_id=f"{DOMAIN}_new_cred_{method}_{cred_i}",
-        )
-
-    @callback
-    def _on_door(self, event: Event) -> None:
-        new = event.data.get("new_state")
-        if new is None:
-            return
-        if self.coordinator.wake is not None:
-            self.coordinator.wake.on_door_change()  # door change -> fetch lock state
-        self._last_applied_dt = time.time()
-        if new.state == "on":  # opened -> can't be deadbolt-locked
-            self._cancel_relock()
-            if self._state == LOCKED:
-                # The deadbolt can't be thrown while the door opens, so opening
-                # from a locked state means the internal thumbturn was used to
-                # unlock — the one manual path the lock reports no DP for.
-                self._last_method = "thumbturn"
-                self._last_user = None
-                self._exit_pending = True  # arm the post-close re-sync
-                self._transition(UNLOCKED, "Unlocked (thumbturn)", inferred=True)
-            else:
-                self._exit_pending = False
-                self._transition(UNLOCKED, "Door opened", inferred=True)
-        elif new.state == "off":  # closed: closing can't throw the deadbolt, so
-            # assume the lock stays unlocked; a genuine handle-lift re-lock
-            # arrives as dp11 on the wake this close triggers. Don't clobber a
-            # more specific unlock reason (e.g. thumbturn) already set.
-            self._cancel_relock()
-            if self._state != UNLOCKED:
-                self._transition(UNLOCKED, "Door closed", inferred=True)
-            if self._exit_pending:
-                # locked -> thumbturn-open -> close: somebody likely left, and a
-                # lock-up tends to happen in the first minute. Re-sync then to
-                # catch it (the immediate close wake fires too early to see it).
-                self._exit_pending = False
-                if self.coordinator.wake is not None:
-                    self.coordinator.wake.schedule_followup()
+        self._state = payload.get("state")
+        self._changed_by = payload.get("changed_by")
+        self._inferred = payload.get("inferred", True)
+        self._last_method = payload.get("last_method")
+        self._last_user = payload.get("last_user")
+        cause_ctx_id = payload.get("cause_ctx_id")
+        user_id = payload.get("user_id")
+        # Attribute the state change to its cause event (parent) + HA user, so the
+        # activity log shows "triggered by <event>" / "By <user>". When neither is
+        # present (a repeat of the same logged state) keep the existing context.
+        if cause_ctx_id or user_id:
+            self.async_set_context(Context(user_id=user_id, parent_id=cause_ctx_id))
+        self.async_write_ha_state()
 
     # -- commands -------------------------------------------------------------
     async def _caller(self) -> tuple[str | None, str | None]:
@@ -391,47 +125,18 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
         return uid, (user.name if user else None)
 
     async def async_lock(self, **kwargs: Any) -> None:
-        # No hardware lock command (the lock auto-relocks), so this is a manual
-        # "mark as locked" to assert the secured state the silent mechanical
-        # thumbturn doesn't report.
-        self._cancel_relock()
-        self._last_applied_dt = time.time()
         uid, _ = await self._caller()
-        self._transition(LOCKED, "Locked in Home Assistant", inferred=True, user_id=uid)
+        await self._controller.async_lock(uid)
 
     async def async_unlock(self, **kwargs: Any) -> None:
         # Show the transitioning ("Unlocking…") state immediately; the cloud
-        # round-trip takes a second or two.
+        # round-trip takes a second or two. The controller performs the actual
+        # transition, which comes back via signal_state.
+        uid, name = await self._caller()
         self._unlocking = True
         self.async_write_ha_state()
-        uid, name = await self._caller()
         try:
-            await self.hass.async_add_executor_job(self._unlock)
-        except Exception:
+            await self._controller.async_unlock(uid, name)
+        finally:
             self._unlocking = False
             self.async_write_ha_state()
-            raise
-        self._unlocking = False
-        self._last_method = "remote"
-        self._last_user = name or "Home Assistant"
-        self._last_applied_dt = time.time()
-        self._transition(UNLOCKED, "Unlocked in Home Assistant", user_id=uid)
-        self._start_relock()
-        # Poll for the lock's own auto-lock (dp11) before the failsafe timer; we
-        # know we unlocked, so arm the polls here rather than waiting on an
-        # inbound unlock event (an HA unlock only echoes a bare dp11:false).
-        if self.coordinator.wake is not None:
-            self.coordinator.wake.on_unlock()
-        await self.coordinator.async_request_refresh()
-
-    def _unlock(self) -> None:
-        mgr = self.coordinator.mgr
-        combined = self.coordinator.combined
-        try:
-            ok = CloudMqttLock(combined, mgr.mqtt_secrets()).unlock()
-        except MqttUnlockError:
-            _LOGGER.debug("MQTT unlock failed; refreshing Tuya session and retrying")
-            mgr.refresh_tuya_session()
-            ok = CloudMqttLock(combined, mgr.mqtt_secrets()).unlock()
-        if not ok:
-            raise HomeAssistantError("Unlock command sent but not confirmed by the lock.")

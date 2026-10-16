@@ -1,4 +1,11 @@
 {
+  "entity": {
+    "event": {
+      "activity": {
+        "name": "Activity"
+      }
+    }
+  },
   "config": {
     "step": {
       "user": {

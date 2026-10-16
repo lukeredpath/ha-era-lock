@@ -1,9 +1,9 @@
-"""Long-lived cloud-MQTT listener for the ERA Protect Lock.
+"""Long-lived cloud-MQTT listener for the ERA Protect Lock (Layer 1 source).
 
-Subscribes to the lock's inbound Tuya MQTT topics and pushes decrypted events to
-the entities via HA's dispatcher:
-  - unlock events (method DP + credential id -> attribution) -> event entity,
-  - lock-state changes (dp61 unlock echo, dp11 anti-lock) -> lock entity.
+Subscribes to the lock's inbound Tuya MQTT topics, decrypts each frame, and
+normalises it into :class:`LockEvent`s published on the ``signal_raw`` dispatcher
+signal. It carries NO decision logic — ordering, debounce, attribution and state
+inference all live in the controller (Layer 2).
 
 Runs a paho client in its own thread (paho-managed); callbacks bridge back to
 the HA loop with ``call_soon_threadsafe``. On an auth failure (expired session
@@ -23,9 +23,9 @@ import paho.mqtt.client as mqtt
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
-from .const import DOMAIN
 from .eralock import dpmap
 from .eralock.mqtt import UNLOCK_ECHO, CloudMqttLock
+from .events import LockEvent, signal_raw
 from .session import EraSessionManager
 
 _LOGGER = logging.getLogger(__name__)
@@ -35,8 +35,17 @@ _LOGGER = logging.getLogger(__name__)
 FRESH_WINDOW = 25
 
 
-def signal_state(entry_id: str) -> str:
-    return f"{DOMAIN}_{entry_id}_state"
+def _alarm_value(raw):
+    """Decode a dp21 (alarm_lock) enum value to its string.
+
+    Enum DPs may arrive as a plain string or base64-encoded; decode the latter,
+    else use the value as-is."""
+    if isinstance(raw, str):
+        try:
+            return base64.b64decode(raw, validate=True).decode("utf-8")
+        except Exception:  # noqa: BLE001
+            return raw
+    return raw
 
 
 def _truthy(v) -> bool:
@@ -163,15 +172,16 @@ class EraMqttListener:
         # dp11 = electronic lock state (true=locked incl. auto-relock + manual
         # handle-lift, false=unlocked). The lock buffers changes and replays them
         # on wake with each dp's real event time in data.t, so we pass the
-        # device-time + a FRESH flag. The lock entity orders by device-time and
+        # device-time + a FRESH flag. The controller orders by device-time and
         # treats fresh events as live (side-effects + logged cause); stale ones
         # only sync the state.
         if "11" in dps:
             dp_ts = tmap.get("11")
             dt = dp_ts if dp_ts is not None else frame_t
             fresh = dp_ts is None or (frame_t - dp_ts) <= FRESH_WINDOW
-            self._dispatch(signal_state, {
-                "locked": bool(dps["11"]), "source": "device", "dt": dt, "fresh": fresh})
+            self._emit(LockEvent(
+                type="state_report", locked=bool(dps["11"]), dt=dt, fresh=fresh,
+                source="device"))
 
         # unlock events (dp61 echo / method dps)
         method: str | None = None
@@ -195,13 +205,36 @@ class EraMqttListener:
                 unlocked = True
         if unlocked:
             fresh = (frame_t - unlock_dt) <= FRESH_WINDOW
-            self._dispatch(signal_state, {
-                "locked": False, "source": "event", "dt": unlock_dt, "fresh": fresh,
-                "method": method, "who": who, "cred": cred_id})
+            self._emit(LockEvent(
+                type="unlock", dt=unlock_dt, fresh=fresh, source="device",
+                method=method, who=who, cred=cred_id))
 
-    def _dispatch(self, signal_fn, payload) -> None:
+        # dp21 = alarm_lock enum (wrong_finger + other alarms); dp22 = hijack.
+        if "21" in dps:
+            val = _alarm_value(dps["21"])
+            if val not in (None, "", 0):
+                dp_ts = tmap.get("21")
+                dt = dp_ts if dp_ts is not None else frame_t
+                fresh = dp_ts is None or (frame_t - dp_ts) <= FRESH_WINDOW
+                if val == "wrong_finger":
+                    self._emit(LockEvent(
+                        type="failed_unlock", method="fingerprint", dt=dt,
+                        fresh=fresh, source="device"))
+                else:
+                    self._emit(LockEvent(
+                        type="tamper", subtype=str(val), dt=dt, fresh=fresh,
+                        source="device"))
+        if "22" in dps and _truthy(dps["22"]):
+            dp_ts = tmap.get("22")
+            dt = dp_ts if dp_ts is not None else frame_t
+            fresh = dp_ts is None or (frame_t - dp_ts) <= FRESH_WINDOW
+            self._emit(LockEvent(
+                type="tamper", subtype="hijack", dt=dt, fresh=fresh,
+                source="device"))
+
+    def _emit(self, event: LockEvent) -> None:
         self.hass.loop.call_soon_threadsafe(
-            async_dispatcher_send, self.hass, signal_fn(self.entry_id), payload)
+            async_dispatcher_send, self.hass, signal_raw(self.entry_id), event)
 
     # -- recovery -------------------------------------------------------------
     def _refresh_and_reconnect(self) -> None:

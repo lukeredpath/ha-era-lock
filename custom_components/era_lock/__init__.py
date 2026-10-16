@@ -21,6 +21,7 @@ from .const import (
     DEFAULT_WAKE_HEARTBEAT,
     PLATFORMS,
 )
+from .controller import EraController
 from .coordinator import EraLockCoordinator
 from .eralock.secrets import DEFAULTS
 from .eralock.session import Session
@@ -50,12 +51,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: EraConfigEntry) -> bool:
     await coordinator.async_refresh()
     entry.runtime_data = coordinator
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
-    # Start the persistent cloud-MQTT listener (push state + unlock events).
+    # Layer 1: the persistent cloud-MQTT listener (normalises frames -> signal_raw).
     listener = EraMqttListener(hass, mgr, combined, entry.entry_id)
     coordinator.listener = listener
-    await hass.async_add_executor_job(listener.start)
 
     # Intelligent wake: pick up buffered events at worthwhile moments.
     wake = EraWakeManager(
@@ -64,6 +62,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: EraConfigEntry) -> bool:
     )
     coordinator.wake = wake
     listener.set_wake_manager(wake)
+
+    # Layer 2: the controller owns all decision logic. Start it (subscribe to
+    # signal_raw + the door entity) before the listener begins emitting.
+    controller = EraController(hass, entry, coordinator)
+    coordinator.controller = controller
+    controller.start()
+    entry.async_on_unload(controller.stop)
+
+    # Layer 3: the entities (lock/sensor/button/event).
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    await hass.async_add_executor_job(listener.start)
     wake.start()
 
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))

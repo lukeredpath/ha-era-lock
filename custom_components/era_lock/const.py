@@ -12,7 +12,8 @@ EVENT_CAUSE = "era_lock_cause"
 # entity's own name so the two don't read as the same source.
 CAUSE_SOURCE = "ERA Protect Lock Activity"
 
-PLATFORMS: list[Platform] = [Platform.LOCK, Platform.SENSOR, Platform.BUTTON]
+PLATFORMS: list[Platform] = [
+    Platform.LOCK, Platform.SENSOR, Platform.BUTTON, Platform.EVENT]
 
 # --- config entry data keys --------------------------------------------------
 CONF_ERA = "era"                       # refresh token + ERA bridge config

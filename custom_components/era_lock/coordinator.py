@@ -41,6 +41,7 @@ class EraLockCoordinator(DataUpdateCoordinator[dict]):
         self.combined = combined
         self.listener = None  # EraMqttListener, set during setup
         self.wake = None  # EraWakeManager, set during setup
+        self.controller = None  # EraController, set during setup
         self._local = LocalLock(combined)
 
     @property
