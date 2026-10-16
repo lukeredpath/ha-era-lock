@@ -30,10 +30,9 @@ from .session import EraSessionManager
 
 _LOGGER = logging.getLogger(__name__)
 
-# A dp11 change whose device event-time is older than this behind the frame time
-# is a buffered history replay (the lock dumps changes when it wakes), not a live
-# transition, so it doesn't drive state.
-STALE_STATE_S = 20
+# A DP whose device event-time is within this of the frame time is a LIVE action;
+# older than this it's a buffered history replay (the lock dumps changes on wake).
+FRESH_WINDOW = 25
 
 
 def signal_state(entry_id: str) -> str:
@@ -80,7 +79,6 @@ class EraMqttListener:
         self._roster = dpmap.roster_from_config(combined)
         self._client: mqtt.Client | None = None
         self._closing = False
-        self._last_state_ts = 0  # guard against stale DP replays on lock wake
         self._wake_manager = None  # set via set_wake_manager()
 
     def set_wake_manager(self, wake_manager) -> None:
@@ -162,23 +160,23 @@ class EraMqttListener:
         frame_t = obj.get("t", 0)
         tmap = data.get("t") if isinstance(data.get("t"), dict) else {}
 
-        # dp11 = electronic lock state; true=locked (incl. auto-relock), false=
-        # unlocked. It's delivered when the BLE lock wakes (with each dp's real
-        # event time in data.t), so guard against stale replays by timestamp.
+        # dp11 = electronic lock state (true=locked incl. auto-relock + manual
+        # handle-lift, false=unlocked). The lock buffers changes and replays them
+        # on wake with each dp's real event time in data.t, so we pass the
+        # device-time + a FRESH flag. The lock entity orders by device-time and
+        # treats fresh events as live (side-effects + logged cause); stale ones
+        # only sync the state.
         if "11" in dps:
             dp_ts = tmap.get("11")
-            fresh = dp_ts is None or (frame_t - dp_ts) <= STALE_STATE_S
-            if fresh and frame_t >= self._last_state_ts:
-                self._last_state_ts = frame_t
-                locked = bool(dps["11"])
-                self._dispatch(signal_state, {
-                    "locked": locked, "source": "device",
-                    "method": "auto-relock (device)" if locked else "device",
-                })
+            dt = dp_ts if dp_ts is not None else frame_t
+            fresh = dp_ts is None or (frame_t - dp_ts) <= FRESH_WINDOW
+            self._dispatch(signal_state, {
+                "locked": bool(dps["11"]), "source": "device", "dt": dt, "fresh": fresh})
 
-        # unlock events (dp61 echo / method dps) -> event + unlocked state
+        # unlock events (dp61 echo / method dps)
         method: str | None = None
         who: str | None = None
+        unlock_dt = frame_t
         unlocked = dps.get(UNLOCK_ECHO[0]) == UNLOCK_ECHO[1]  # dp61 "AEkA"
         if unlocked:
             method = "remote"
@@ -191,11 +189,13 @@ class EraMqttListener:
                 cred = _dp_value(raw)
                 method = dpmap.METHOD_DP_LABELS[dp_id]
                 who = dpmap.attribute(dp_id, cred if cred is not None else 0, self._roster)
+                unlock_dt = tmap.get(str(dp_id), frame_t)
                 unlocked = True
-        if unlocked and frame_t >= self._last_state_ts:
-            self._last_state_ts = frame_t
+        if unlocked:
+            fresh = (frame_t - unlock_dt) <= FRESH_WINDOW
             self._dispatch(signal_state, {
-                "locked": False, "source": "event", "method": method, "who": who})
+                "locked": False, "source": "event", "dt": unlock_dt, "fresh": fresh,
+                "method": method, "who": who})
 
     def _dispatch(self, signal_fn, payload) -> None:
         self.hass.loop.call_soon_threadsafe(
