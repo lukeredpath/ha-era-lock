@@ -1,12 +1,14 @@
 """Canonical event model + dispatcher signals for the ERA Protect Lock.
 
-The three layers communicate over three HA dispatcher signals:
+The three layers communicate over four HA dispatcher signals:
   - ``signal_raw``   Layer 1 (sources) -> Layer 2 (controller): normalised
     :class:`LockEvent`s, no decision logic attached;
   - ``signal_event`` Layer 2 -> the event entity: enriched discrete activity
     events (unlock/lock/failed_unlock/tamper/door) for the activity log;
   - ``signal_state`` Layer 2 -> the lock entity: state-model updates the lock
-    entity renders verbatim.
+    entity renders verbatim;
+  - ``signal_link``  Layer 2 -> the connectivity binary sensor: the lock's link
+    state (``{"online": bool, "cause_ctx_id": str}``) on each transition.
 
 A :class:`LockEvent` is the single currency Layer 1 produces. It is deliberately
 plain data (no HA imports) so the normalisation/decision logic is testable
@@ -57,3 +59,7 @@ def signal_event(entry_id: str) -> str:
 
 def signal_state(entry_id: str) -> str:
     return f"{DOMAIN}_{entry_id}_state"
+
+
+def signal_link(entry_id: str) -> str:
+    return f"{DOMAIN}_{entry_id}_link"

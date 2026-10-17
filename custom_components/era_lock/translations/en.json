@@ -16,6 +16,11 @@
           }
         }
       }
+    },
+    "binary_sensor": {
+      "connected": {
+        "name": "Connected"
+      }
     }
   },
   "config": {

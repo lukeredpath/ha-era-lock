@@ -18,7 +18,8 @@ EVENT_CAUSE = "era_lock_cause"
 CAUSE_SOURCE = "ERA Protect Lock Activity"
 
 PLATFORMS: list[Platform] = [
-    Platform.LOCK, Platform.SENSOR, Platform.BUTTON, Platform.EVENT]
+    Platform.LOCK, Platform.SENSOR, Platform.BINARY_SENSOR, Platform.BUTTON,
+    Platform.EVENT]
 
 # --- config entry data keys --------------------------------------------------
 CONF_ERA = "era"                       # refresh token + ERA bridge config

@@ -86,10 +86,11 @@ def lock_message(source: str | None) -> str:
 
 # Lock link state (see controller._set_online). While the hub reports the lock
 # offline, actions at the door are neither reported live nor buffered, so the
-# shown state can't be trusted until it reconnects.
+# shown state can't be trusted, even after it reconnects.
 LOCK_OFFLINE = "Lock offline (state unknown)"
 LOCK_ONLINE = "Lock back online"
-ONLINE_UNCONFIRMED = "Lock back online (state unconfirmed)"
+# Reconnect: the state is unknown until the next real event resolves it.
+ONLINE_UNKNOWN = "Lock back online (state unknown)"
 
 
 def describe(

@@ -7,7 +7,9 @@ handling, auto-relock failsafe, credential auto-discovery, attribution), drives
 the wake manager, and performs the cloud unlock command. It emits two outputs:
 
   - ``signal_event``  enriched discrete activity events for the event entity;
-  - ``signal_state``  state-model updates the lock entity renders verbatim.
+  - ``signal_state``  state-model updates the lock entity renders verbatim;
+  - ``signal_link``   the lock's link state (hub presence) for the connectivity
+    binary sensor.
 
 Attribution linkage: every discrete activity event carries a cause ``Context``
 id (``cause_ctx``). The event entity publishes the activity with that id — both
@@ -49,7 +51,7 @@ from .const import (
     DOMAIN,
 )
 from .eralock.mqtt import CloudMqttLock, MqttUnlockError
-from .events import LockEvent, signal_event, signal_raw, signal_state
+from .events import LockEvent, signal_event, signal_link, signal_raw, signal_state
 from .wake import POST_CLOSE_SYNC_S
 
 if TYPE_CHECKING:
@@ -179,13 +181,19 @@ class EraController:
         self._exit_pending: bool = False
         # The hub's view of the lock's link. While offline, actions at the door
         # are neither reported nor buffered, so the state can't be trusted: the
-        # lock entity goes unavailable (see _set_online).
+        # lock entity goes unavailable (see _set_online). Assumed online at
+        # startup: the hub only reports presence on change.
         self._online: bool = True
         self._relock_cancel = None
         self._logged_state: str | None = "__init__"  # state-change de-dupe
         # -- subscriptions ----------------------------------------------------
         self._unsub_raw = None
         self._unsub_door = None
+
+    @property
+    def online(self) -> bool:
+        """The hub's view of the lock's link (True = awake or asleep/nearby)."""
+        return self._online
 
     # -- options --------------------------------------------------------------
     @property
@@ -499,11 +507,35 @@ class EraController:
         (a cloud unlock can't reach an offline lock). The Sync button stays
         available to retry. Each transition gets an activity line ("Lock
         offline (state unknown)" / "Lock back online") that the entity's
-        unavailable / restored row parents to. On reconnect the last known
-        state is restored but marked inferred (it may have changed unseen) and
-        a sync is forced."""
+        unavailable / restored row (and the connectivity sensor's row) parents
+        to.
+
+        On reconnect the state is UNKNOWN, not the last known one: whatever
+        happened at the door during the outage was lost, so "locked" may be
+        wrong. A sync is forced, and the next real event (device lock/unlock
+        DP, door change, HA command) resolves it as usual. When the reconnect
+        is implied by a device DP frame, _on_raw calls this BEFORE processing
+        that DP, so the DP's own state lands after (not under) the unknown.
+
+        Nothing armed before the outage may re-impose a stale state afterwards:
+          - a debounced device state (``_apply``) still pending at the drop is
+            flushed immediately — it's a real pre-outage report, so its row
+            lands before the outage rather than after the reconnect;
+          - the auto-relock failsafe is cancelled on the drop: it's an
+            inference from the pre-outage unlock, and firing it while offline
+            (or after, onto unknown) would fabricate an "Auto-locked" line;
+          - a door hold is left to resolve on its timer: it only emits the
+            unlock's ATTRIBUTION line (a flush may still arrive after the
+            reconnect), never a state — the reconnect clears the refinable
+            ctx, so its _refine_unlock no-ops."""
         if online == self._online:
             return
+        if not online:
+            # Settle the pre-outage report while the entity is still available.
+            if self._device_debounce is not None:
+                self._cancel_device_debounce()
+                self._apply()
+            self._cancel_relock()
         self._online = online
         _LOGGER.debug("lock link -> %s", "online" if online else "OFFLINE")
         ev = LockEvent(type="connectivity", dt=time.time(), source="hub",
@@ -511,12 +543,21 @@ class EraController:
         ctx_id = Context().id
         self._emit_event("connectivity", ev, cause_ctx_id=ctx_id, user_id=None)
         if online:
+            # Defensive: nothing from before the outage survives the reconnect.
+            self._cancel_relock()
+            self._cancel_device_debounce()
+            self._pending = None
+            self._pending_ctx_id = None
+            self._attributable_ctx_id = None
+            self._state = None
+            self._logged_state = None
+            self._changed_by = activity.ONLINE_UNKNOWN
             self._inferred = True
-            if self._state is not None:
-                self._changed_by = activity.ONLINE_UNCONFIRMED
             if self.coordinator.wake is not None:
                 self.coordinator.wake.on_reconnect()
         self._publish_state(ctx_id, None)
+        async_dispatcher_send(self.hass, signal_link(self.entry_id), {
+            "online": online, "cause_ctx_id": ctx_id})
 
     @callback
     def _on_push_state(self, ev: LockEvent) -> None:
