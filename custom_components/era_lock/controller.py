@@ -9,15 +9,15 @@ the wake manager, and performs the cloud unlock command. It emits two outputs:
   - ``signal_event``  enriched discrete activity events for the event entity;
   - ``signal_state``  state-model updates the lock entity renders verbatim.
 
-Attribution linkage: every state transition caused by a discrete event mints a
-single ``Context`` (``cause_ctx``). The discrete event is published with that
-context's id as its own id (it becomes the activity-log root cause row); the
-state update is published with that id as a parent, so the lock state change is
-shown "triggered by" its event and attributed to the right HA user.
-
-This is a behaviour-preserving port of the old ``EraLockEntity`` state machine;
-semantics are unchanged except for the added event-entity output and context
-threading.
+Attribution linkage: every discrete activity event carries a cause ``Context``
+id (``cause_ctx``). The event entity publishes the activity with that id — both
+its own state change and the rich ``EVENT_ACTIVITY`` logbook row ("Unlocked by
+Luke (fingerprint)") — and a lock state change caused by that activity is
+published with the same id as its parent, so it is shown "triggered by" / "By
+<user>" its activity. INVARIANT: a state transition only ever parents to the
+context of a discrete event that is (or will be) actually emitted for it — see
+the dp61/method-DP coalescer and the door-open hold, which both reuse one
+reserved context for whichever event finally represents the physical unlock.
 """
 from __future__ import annotations
 
@@ -37,17 +37,16 @@ from homeassistant.helpers.event import (
     async_track_state_change_event,
 )
 
+from . import activity
 from .attribution import actor as attr_actor
 from .attribution import as_int, lookup
 from .const import (
-    CAUSE_SOURCE,
     CONF_AUTO_RELOCK_SECONDS,
     CONF_CREDENTIALS,
     CONF_DOOR_CONTACT_ENTITY_ID,
     CREDENTIAL_METHODS,
     DEFAULT_AUTO_RELOCK_SECONDS,
     DOMAIN,
-    EVENT_CAUSE,
 )
 from .eralock.mqtt import CloudMqttLock, MqttUnlockError
 from .events import LockEvent, signal_event, signal_raw, signal_state
@@ -69,6 +68,68 @@ DEVICE_DEBOUNCE_S = 2.0  # coalesce dp11 mini-history bursts into one transition
 # fall within this window into ONE physical unlock; a real method DP beats the bare
 # "remote" echo (see _emit_unlock_discrete). Unlocks further apart stay distinct.
 UNLOCK_COALESCE_S = 2.0
+
+# Door opened while we believe the lock is LOCKED: the door can't be open with the
+# deadbolt thrown, so the state is UNLOCKED at once — but HOW it was unlocked is
+# ambiguous. The lock buffers local actions (fingerprint/card) while asleep, so a
+# credential unlock may still be in flight; only if none turns up is it the
+# internal thumbturn (the one manual path that reports no DP). So the unlock's
+# attribution + discrete event are HELD for DOOR_HOLD_S while the door-triggered
+# wake flushes the buffer. Flushes typically land ~3s after a wake (plus up to
+# UNLOCK_COALESCE_S for a dp61/dp62 pair); 10s gives ~3x headroom for a slow BLE
+# reconnect, and the cost of waiting is only a later activity line — the lock
+# state itself is already correct.
+DOOR_HOLD_S = 10.0
+# A credential unlock explains the door opening if its device-time is up to this
+# long BEFORE the open (people unlock, then open). Matches the 60s minimum relock
+# failsafe: beyond that the lock would have auto-relocked (and an intervening
+# device lock disqualifies the credential anyway — see _pick_door_cause).
+DOOR_LOOKBACK_S = 60.0
+# Device clock vs HA wall-clock skew allowance (a credential "after" the open by
+# less than this still counts as before it).
+DOOR_CLOCK_SLACK_S = 5.0
+# Unlock methods that can explain a door opening from locked. "remote" is the
+# bare dp61 echo — a lone echo is still a real remote unlock.
+DOOR_CAUSE_METHODS = ("fingerprint", "card", "ble", "phone_remote", "voice", "remote")
+
+
+class _DoorHold:
+    """A door-open-from-locked whose unlock attribution is being held."""
+
+    __slots__ = ("ctx_id", "open_t", "candidates", "lock_dts", "cancel")
+
+    def __init__(self, ctx_id: str, open_t: float) -> None:
+        self.ctx_id = ctx_id          # reserved cause ctx (state already parents to it)
+        self.open_t = open_t          # wall-clock time the door opened
+        self.candidates: list[tuple[LockEvent, str | None]] = []
+        self.lock_dts: list[float] = []  # device locks seen in the lookback
+        self.cancel = None
+
+    def in_window(self, dt: float) -> bool:
+        return (self.open_t - DOOR_LOOKBACK_S) <= dt <= (self.open_t + DOOR_CLOCK_SLACK_S)
+
+    def accepts(self, ev: LockEvent) -> bool:
+        return ev.method in DOOR_CAUSE_METHODS and self.in_window(ev.dt)
+
+
+def _pick_door_cause(
+    candidates: list[tuple[LockEvent, str | None]], lock_dts: list[float],
+    open_t: float,
+) -> tuple[LockEvent, str | None] | None:
+    """Choose the credential unlock that explains a door opening, if any.
+
+    A candidate is disqualified by a device lock between it and the open (the
+    lock relocked, so something else unlocked it again). Of the rest the latest
+    wins; within UNLOCK_COALESCE_S of it a real method DP beats the bare dp61
+    "remote" echo (same rule as _emit_unlock_discrete)."""
+    valid = [c for c in candidates
+             if not any(c[0].dt < ldt < open_t for ldt in lock_dts)]
+    if not valid:
+        return None
+    latest = max(c[0].dt for c in valid)
+    group = [c for c in valid if latest - c[0].dt <= UNLOCK_COALESCE_S]
+    pool = [c for c in group if c[0].method != "remote"] or group
+    return max(pool, key=lambda c: c[0].dt)
 
 
 class EraController:
@@ -96,9 +157,17 @@ class EraController:
         self._unlock_echo = None            # buffered (ev, ctx_id, user_id) echo
         self._unlock_echo_cancel = None     # its flush timer
         self._last_unlock_discrete_dt: float | None = None  # dt of last unlock emitted
+        # (ev, ctx_id, user_id) of the last unlock discrete event emitted
+        self._last_unlock: tuple[LockEvent, str | None, str | None] | None = None
+        # ctx of the current UNLOCKED state whose reason may still be refined by
+        # a better-attributed event for the same physical unlock (a method DP
+        # superseding the dp61 echo after the state applied; a resolved door
+        # hold). None otherwise.
+        self._attributable_ctx_id: str | None = None
+        self._door_hold: _DoorHold | None = None  # door-open-from-locked hold
         self._exit_pending: bool = False  # locked->thumbturn-open awaiting a close
         self._relock_cancel = None
-        self._logged_state: str | None = "__init__"  # cause/logbook de-dupe
+        self._logged_state: str | None = "__init__"  # state-change de-dupe
         # -- subscriptions ----------------------------------------------------
         self._unsub_raw = None
         self._unsub_door = None
@@ -140,6 +209,9 @@ class EraController:
         self._cancel_relock()
         self._cancel_device_debounce()
         self._cancel_unlock_echo()
+        if self._door_hold is not None and self._door_hold.cancel is not None:
+            self._door_hold.cancel()
+        self._door_hold = None
 
     # -- transition + outputs -------------------------------------------------
     @callback
@@ -150,32 +222,39 @@ class EraController:
     ) -> None:
         """Change state and attribute it to the event that caused it.
 
-        Pass EITHER ``cause_ctx_id`` — when the discrete activity event was
-        already published on arrival (listener-sourced, via _on_push_state) — OR
-        ``discrete`` + ``cause_event`` for a direct transition (command, door,
-        timer) whose discrete event is published here. One cause context is shared
-        by the discrete event, the EVENT_CAUSE logbook row, and the state change,
-        so the activity log shows the state change "triggered by" its event (and
-        "By <user>"). ``inferred`` marks a state HA deduced (door sensor, relock
-        timer, manual assertion). The context is minted only when the state
-        actually changes (de-dupe by ``_logged_state``)."""
+        Pass ``cause_ctx_id`` when the discrete activity event was (or will be)
+        published elsewhere — listener-sourced events on arrival, a held door
+        unlock on resolution — or ``discrete`` + ``cause_event`` for a direct
+        transition (command, timer) whose discrete event is published here.
+        The discrete event is ALWAYS published when given (so an HA unlock while
+        already unlocked still gets its activity line); the state change
+        parents to the cause context only when the state actually changes
+        (de-dupe by ``_logged_state``), so the lock's "-> unlocked" row is shown
+        "triggered by" / "By <user>" its activity line. ``inferred`` marks a
+        state HA deduced (door sensor, relock timer, manual assertion)."""
         self._changed_by = reason
         self._inferred = inferred
         _LOGGER.debug("lock -> %s  (%s)%s", state or "unknown", reason,
                       " [inferred]" if inferred else "")
-        if state != self._logged_state:
-            self._logged_state = state
+        if discrete and cause_event is not None:
             if cause_ctx_id is None:
                 cause_ctx_id = Context(user_id=user_id).id
-            if discrete and cause_event is not None:
-                self._emit_event(discrete, cause_event,
-                                 cause_ctx_id=cause_ctx_id, user_id=user_id)
-            self.hass.bus.async_fire(
-                EVENT_CAUSE, {"name": CAUSE_SOURCE, "message": reason},
-                context=Context(id=cause_ctx_id, user_id=user_id))
+            self._emit_event(discrete, cause_event,
+                             cause_ctx_id=cause_ctx_id, user_id=user_id)
+        if state != self._logged_state:
+            self._logged_state = state
+            self._attributable_ctx_id = None
+            if cause_ctx_id is None:
+                # No activity behind this change (e.g. a bare dp11 sync): still
+                # give the state row a fresh context so it can't inherit one.
+                cause_ctx_id = Context(user_id=user_id).id
         else:
             cause_ctx_id = None  # repeat of the same logged state: no new cause
         self._state = state
+        self._publish_state(cause_ctx_id, user_id)
+
+    @callback
+    def _publish_state(self, cause_ctx_id: str | None, user_id: str | None) -> None:
         async_dispatcher_send(self.hass, signal_state(self.entry_id), {
             "state": self._state,
             "changed_by": self._changed_by,
@@ -187,12 +266,29 @@ class EraController:
         })
 
     @callback
+    def _refine_unlock(self, ctx_id: str | None, ev: LockEvent) -> None:
+        """A better-attributed event for the unlock behind the current UNLOCKED
+        state was emitted under the same ``ctx_id`` (a method DP superseding the
+        dp61 echo after the state applied; a resolved door hold): update the
+        reason / last-unlock attributes. No new context — the state row already
+        parents to ``ctx_id`` and the state itself doesn't change."""
+        if (ctx_id is None or self._state != UNLOCKED
+                or self._attributable_ctx_id != ctx_id):
+            return
+        reason, display, _uid = self._attribute_unlock(ev)
+        self._changed_by = reason
+        self._last_method = ev.method
+        self._last_user = display
+        self._publish_state(None, None)
+
+    @callback
     def _emit_event(
         self, etype: str, ev: LockEvent, *, cause_ctx_id: str | None,
         user_id: str | None,
     ) -> None:
         """Publish an enriched discrete activity event. Attribution (label/user/
-        actor) is resolved here so the event entity needs no options access."""
+        actor) and the rich activity line are resolved here so the event entity
+        needs no options access."""
         creds = self._options.get(CONF_CREDENTIALS, [])
         label, mapped_uid, user_name = lookup(creds, ev.method, ev.cred)
         # Only name an actor when there's a real one to name; a plain
@@ -201,6 +297,13 @@ class EraController:
         actor = attr_actor(creds, ev.method, ev.cred, ev.who)
         if actor == "unknown":
             actor = None
+        message = activity.describe(
+            etype, method=ev.method, cred=ev.cred, source=ev.source,
+            subtype=ev.subtype, label=label, user_name=user_name,
+            user_mapped=bool(mapped_uid), who=ev.who)
+        if etype == "unlock":
+            self._last_unlock = (ev, cause_ctx_id, user_id or mapped_uid)
+            self._last_unlock_discrete_dt = ev.dt
         async_dispatcher_send(self.hass, signal_event(self.entry_id), {
             "type": etype,
             "dt": ev.dt,
@@ -213,15 +316,18 @@ class EraController:
             "actor": actor,
             "source": ev.source,
             "subtype": ev.subtype,
+            "message": message,
             "cause_ctx_id": cause_ctx_id,
         })
 
     # -- unlock-event coalescing ----------------------------------------------
     @callback
     def _emit_unlock_discrete(
-        self, ev: LockEvent, ctx_id: str | None, user_id: str | None,
-    ) -> None:
-        """Emit exactly one discrete ``unlock`` event per physical unlock.
+        self, ev: LockEvent, ctx_id: str, user_id: str | None,
+    ) -> str | None:
+        """Emit exactly one discrete ``unlock`` event per physical unlock, and
+        return the context id that physical unlock's event uses (the caller
+        parents the state transition to it).
 
         A single remote/app unlock reaches us as TWO ``unlock`` LockEvents from
         two separate MQTT frames ~1s apart with the SAME device-time: the dp61
@@ -231,12 +337,15 @@ class EraController:
         has to happen here, over the event stream.
 
         Precedence: a real METHOD DP beats the bare ``remote`` echo.
-          * method DP -> emit immediately; drop a buffered echo for the same
-            unlock (its attribution is replaced), and a later echo for an
-            already-emitted unlock (within UNLOCK_COALESCE_S) is suppressed.
+          * method DP -> emit immediately; a buffered echo for the same unlock is
+            dropped and the method DP is emitted UNDER THE ECHO'S CONTEXT (the
+            echo arrived first, so it usually won the device-time ordering and
+            the pending state transition already parents to its context). A
+            later echo for an already-emitted unlock (within UNLOCK_COALESCE_S)
+            is suppressed and resolves to the emitted event's context.
           * echo -> hold for UNLOCK_COALESCE_S. A method DP arriving in that
-            window supersedes it (echo dropped); otherwise the echo is emitted,
-            so a lone/app-free dp61 remote unlock (no method DP) still surfaces.
+            window supersedes it (as above); otherwise the echo is emitted, so a
+            lone/app-free dp61 remote unlock (no method DP) still surfaces.
         Unlocks whose device-times are more than UNLOCK_COALESCE_S apart are
         distinct physical unlocks and each emit.
         """
@@ -244,20 +353,32 @@ class EraController:
             if (self._last_unlock_discrete_dt is not None
                     and abs(ev.dt - self._last_unlock_discrete_dt)
                     <= UNLOCK_COALESCE_S):
-                return  # a method DP / command for this unlock already emitted
-            self._cancel_unlock_echo()
+                # a method DP / command for this unlock already emitted
+                return self._last_unlock[1] if self._last_unlock else None
+            held = self._unlock_echo
+            if held is not None:
+                if abs(ev.dt - held[0].dt) <= UNLOCK_COALESCE_S:
+                    return held[1]  # repeat echo for the held unlock
+                self._flush_unlock_echo()  # older distinct echo -> let it out
             self._unlock_echo = (ev, ctx_id, user_id)
             self._unlock_echo_cancel = async_call_later(
                 self.hass, UNLOCK_COALESCE_S, self._flush_unlock_echo)
-            return
+            return ctx_id
         # A real method DP: it wins outright.
-        if self._unlock_echo is not None:
-            if abs(ev.dt - self._unlock_echo[0].dt) <= UNLOCK_COALESCE_S:
-                self._cancel_unlock_echo()  # same unlock -> drop the echo
-            else:
-                self._flush_unlock_echo()   # older distinct echo -> let it out
-        self._last_unlock_discrete_dt = ev.dt
+        held = self._unlock_echo
+        if held is not None:
+            if abs(ev.dt - held[0].dt) <= UNLOCK_COALESCE_S:
+                # Same unlock: drop the echo, adopt its (reserved) context.
+                self._cancel_unlock_echo()
+                ctx_id = held[1]
+                if self._pending is held[0]:
+                    self._pending = ev  # state not applied yet: richer reason
+                self._emit_event("unlock", ev, cause_ctx_id=ctx_id, user_id=user_id)
+                self._refine_unlock(ctx_id, ev)  # state already applied
+                return ctx_id
+            self._flush_unlock_echo()   # older distinct echo -> let it out
         self._emit_event("unlock", ev, cause_ctx_id=ctx_id, user_id=user_id)
+        return ctx_id
 
     @callback
     def _flush_unlock_echo(self, _now=None) -> None:
@@ -267,7 +388,6 @@ class EraController:
             return
         self._unlock_echo = None
         ev, ctx_id, user_id = pending
-        self._last_unlock_discrete_dt = ev.dt
         self._emit_event("unlock", ev, cause_ctx_id=ctx_id, user_id=user_id)
 
     @callback
@@ -276,6 +396,14 @@ class EraController:
             self._unlock_echo_cancel()
             self._unlock_echo_cancel = None
         self._unlock_echo = None
+
+    def _unlock_near(self, dt: float):
+        """The (ev, ctx_id, user_id) of the held or last-emitted unlock event for
+        the physical unlock at device-time ``dt`` (within UNLOCK_COALESCE_S)."""
+        for cand in (self._unlock_echo, self._last_unlock):
+            if cand is not None and abs(cand[0].dt - dt) <= UNLOCK_COALESCE_S:
+                return cand
+        return None
 
     # -- auto-relock timer ----------------------------------------------------
     @callback
@@ -302,9 +430,11 @@ class EraController:
         self._relock_cancel = None
         if self._door_open():
             return  # door-open suppresses the timed relock
+        if self._state == LOCKED:
+            return  # already locked: nothing to assume (and no activity line)
         self._last_applied_dt = time.time()
         ev = LockEvent(type="state_report", dt=time.time(), source="timer", locked=True)
-        self._transition(LOCKED, "Auto-lock (timer)", inferred=True,
+        self._transition(LOCKED, activity.lock_message("timer"), inferred=True,
                          cause_event=ev, discrete="lock")
 
     def _door_open(self) -> bool:
@@ -337,19 +467,32 @@ class EraController:
         # Emit the discrete activity event NOW — decoupled from the coalesced
         # state — so every unlock/lock is surfaced even when a buffered flush
         # nets it away (unlock -> relock settles on locked, but both happened).
-        # Mint its context and remember it so, if this event wins the debounce,
-        # the resulting state change is attributed to it. The event entity
-        # de-dupes re-flushes by device-time.
+        # Remember its context so, if this event wins the debounce, the
+        # resulting state change is attributed to it. The event entity de-dupes
+        # re-flushes by device-time.
         ctx_id: str | None = None
+        hold = self._door_hold
         if ev.type == "unlock":
             _label, uid, _name = lookup(
                 self._options.get(CONF_CREDENTIALS, []), ev.method, ev.cred)
             ev_user = ev.user_id or uid
-            ctx_id = Context(user_id=ev_user).id
-            # Coalesce the dp61 "remote" echo with its method DP so one physical
-            # unlock yields exactly one discrete event (see _emit_unlock_discrete).
-            self._emit_unlock_discrete(ev, ctx_id, ev_user)
+            echo_of_emitted = (
+                ev.method == "remote" and self._last_unlock_discrete_dt is not None
+                and abs(ev.dt - self._last_unlock_discrete_dt) <= UNLOCK_COALESCE_S)
+            if hold is not None and hold.accepts(ev) and not echo_of_emitted:
+                # A (buffered) credential unlock that may explain a held
+                # door-open: collect it; the hold emits ONE unlock on resolution
+                # under its reserved context.
+                hold.candidates.append((ev, ev_user))
+                ctx_id = hold.ctx_id
+            else:
+                # Coalesce the dp61 "remote" echo with its method DP so one
+                # physical unlock yields exactly one discrete event.
+                ctx_id = self._emit_unlock_discrete(
+                    ev, Context(user_id=ev_user).id, ev_user)
         elif ev.type == "state_report" and ev.locked:
+            if hold is not None and hold.in_window(ev.dt):
+                hold.lock_dts.append(ev.dt)
             ctx_id = Context().id
             self._emit_event("lock", ev, cause_ctx_id=ctx_id, user_id=None)
 
@@ -388,16 +531,24 @@ class EraController:
         new = LOCKED if ev.locked else UNLOCKED
         if new == self._state:
             return  # no state change (the discrete event was already emitted)
+        cause = ev
+        if new == UNLOCKED and ev.type != "unlock":
+            # A bare dp11:false won the ordering, but the unlock it reports has
+            # its own (method/echo) event: attribute + link to THAT event.
+            near = self._unlock_near(ev.dt)
+            if near is not None:
+                cause, cause_ctx_id = near[0], near[1]
         user_id: str | None = None
+        refinable = False
         if ev.fresh:
             if new == UNLOCKED:
-                reason, display, user_id = self._attribute_unlock(
-                    ev.method, ev.cred, ev.who)
-                self._last_method = ev.method
+                reason, display, user_id = self._attribute_unlock(cause)
+                self._last_method = cause.method
                 self._last_user = display
+                refinable = cause_ctx_id is not None
             else:
                 self._cancel_relock()
-                reason = "Device Locked"
+                reason = activity.lock_message(ev.source)
         else:
             # buffered history: sync to the lock's real final state, don't replay
             if new == LOCKED:
@@ -406,29 +557,27 @@ class EraController:
         # The discrete event was already published in _on_push_state; link this
         # state change to it (cause_ctx_id) rather than emitting again.
         self._transition(new, reason, user_id=user_id, cause_ctx_id=cause_ctx_id)
+        if refinable:
+            self._attributable_ctx_id = cause_ctx_id
 
     def _attribute_unlock(
-        self, method: str | None, cred, who: str | None
+        self, ev: LockEvent
     ) -> tuple[str, str | None, str | None]:
-        """Resolve an unlock credential to (reason, display_user, user_id).
+        """Resolve an unlock event to (reason, display_user, user_id).
 
-        Priority: an options-configured credential — mapped HA user, else its
-        custom label — then the frida roster name (``who``), then the raw
-        method+id. When a credential maps to an HA user, ``user_id`` is returned
-        so the state change is attributed to them ("By <user>") with the method."""
-        label, uid, user_name = lookup(self._options.get(CONF_CREDENTIALS, []), method, cred)
-        if uid:
-            name = user_name or "a Home Assistant user"
-            return f"Unlocked by {name} ({method})", name, uid
-        if label:
-            return f"Unlocked by {label} ({method})", label, None
-        if who:
-            return f"Unlocked by {who}", who, None
-        cred_i = as_int(cred)
-        if method:
-            tag = f"{method} #{cred_i}" if cred_i is not None else method
-            return f"Unlocked ({tag})", None, None
-        return "Unlocked", None, None
+        The reason is the same rich line the activity log shows (see
+        activity.unlock_message). When the credential maps to an HA user (or the
+        event carries one, e.g. an HA command), ``user_id`` is returned so the
+        state change is attributed to them ("By <user>")."""
+        label, uid, user_name = lookup(
+            self._options.get(CONF_CREDENTIALS, []), ev.method, ev.cred)
+        reason = activity.unlock_message(
+            ev.method, ev.cred, source=ev.source, label=label,
+            user_name=user_name, user_mapped=bool(uid), who=ev.who)
+        display = activity.unlock_actor(
+            ev.method, ev.cred, label=label, user_name=user_name,
+            user_mapped=bool(uid), who=ev.who)
+        return reason, display, uid or ev.user_id
 
     @callback
     def _maybe_discover_credential(self, method: str, cred) -> None:
@@ -465,28 +614,40 @@ class EraController:
         new = event.data.get("new_state")
         if new is None:
             return
+        opened_from_locked = new.state == "on" and self._state == LOCKED
         if self.coordinator.wake is not None:
-            self.coordinator.wake.on_door_change()  # door change -> fetch lock state
+            # door change -> fetch lock state. Opening from locked forces the
+            # wake past the battery rate limit: the held attribution below
+            # depends on the buffered flush it triggers.
+            self.coordinator.wake.on_door_change(force=opened_from_locked)
         self._last_applied_dt = time.time()
         if new.state == "on":  # opened -> can't be deadbolt-locked
             self._cancel_relock()
-            if self._state == LOCKED:
-                # The deadbolt can't be thrown while the door opens, so opening
-                # from a locked state means the internal thumbturn was used to
-                # unlock — the one manual path the lock reports no DP for.
-                self._last_method = "thumbturn"
-                self._last_user = None
+            if opened_from_locked:
+                # Unlocked for certain, but HOW is ambiguous: a fingerprint/card
+                # unlock may still be buffered in the lock. Go UNLOCKED now and
+                # hold the attribution for the flush (see DOOR_HOLD_S); the state
+                # change parents to the hold's reserved context, which the
+                # eventual unlock event (credential, else thumbturn) is emitted
+                # under.
+                self._resolve_door_hold()  # settle any earlier hold first
                 self._exit_pending = True  # arm the post-close re-sync
-                ev = LockEvent(type="unlock", dt=time.time(), source="door",
-                               method="thumbturn")
-                self._transition(UNLOCKED, "Unlocked (thumbturn)", inferred=True,
-                                 cause_event=ev, discrete="unlock")
+                self._last_method = None   # unknown until the hold resolves
+                self._last_user = None
+                hold = _DoorHold(Context().id, time.time())
+                hold.cancel = async_call_later(
+                    self.hass, DOOR_HOLD_S, self._resolve_door_hold)
+                self._door_hold = hold
+                self._transition(UNLOCKED, "Door opened (syncing with lock)",
+                                 inferred=True, cause_ctx_id=hold.ctx_id)
+                self._attributable_ctx_id = hold.ctx_id
             else:
                 self._exit_pending = False
-                ev = LockEvent(type="door", dt=time.time(), source="door",
-                               subtype="open")
-                self._transition(UNLOCKED, "Door opened", inferred=True,
-                                 cause_event=ev, discrete="door")
+                if self._state != UNLOCKED:
+                    ev = LockEvent(type="door", dt=time.time(), source="door",
+                                   subtype="open")
+                    self._transition(UNLOCKED, "Door opened", inferred=True,
+                                     cause_event=ev, discrete="door")
         elif new.state == "off":  # closed: closing can't throw the deadbolt, so
             # assume the lock stays unlocked; a genuine handle-lift re-lock
             # arrives as dp11 on the wake this close triggers. Don't clobber a
@@ -505,6 +666,39 @@ class EraController:
                 if self.coordinator.wake is not None:
                     self.coordinator.wake.schedule_followup()
 
+    @callback
+    def _resolve_door_hold(self, _now=None) -> None:
+        """Settle a held door-open: emit ONE unlock under the hold's context —
+        the credential unlock that explains it, else the thumbturn. Credential
+        unlocks collected but not chosen (disqualified by an intervening device
+        lock) are genuine earlier unlocks and are emitted as their own events."""
+        hold = self._door_hold
+        if hold is None:
+            return
+        self._door_hold = None
+        if hold.cancel is not None:
+            hold.cancel()
+            hold.cancel = None
+        winner = _pick_door_cause(hold.candidates, hold.lock_dts, hold.open_t)
+        for ev, user in sorted(hold.candidates, key=lambda c: c[0].dt):
+            if winner is not None and ev is winner[0]:
+                continue
+            if ev.method == "remote" and any(
+                    o is not ev and o.method != "remote"
+                    and abs(o.dt - ev.dt) <= UNLOCK_COALESCE_S
+                    for o, _u in hold.candidates):
+                continue  # dp61 echo of a collected method DP
+            self._emit_event("unlock", ev, cause_ctx_id=Context(user_id=user).id,
+                             user_id=user)
+        if winner is not None:
+            ev, user = winner
+        else:
+            ev, user = LockEvent(type="unlock", dt=hold.open_t, source="door",
+                                 method="thumbturn"), None
+        _LOGGER.debug("door hold resolved: %s", ev.method)
+        self._emit_event("unlock", ev, cause_ctx_id=hold.ctx_id, user_id=user)
+        self._refine_unlock(hold.ctx_id, ev)
+
     # -- commands (called by the lock entity, which resolves the caller) ------
     async def async_lock(self, user_id: str | None) -> None:
         # No hardware lock command (the lock auto-relocks), so this is a manual
@@ -514,7 +708,7 @@ class EraController:
         self._last_applied_dt = time.time()
         ev = LockEvent(type="state_report", dt=time.time(), source="command",
                        locked=True)
-        self._transition(LOCKED, "Locked in Home Assistant", inferred=True,
+        self._transition(LOCKED, activity.lock_message("command"), inferred=True,
                          user_id=user_id, cause_event=ev, discrete="lock")
 
     async def async_unlock(self, user_id: str | None, user_name: str | None) -> None:
@@ -524,10 +718,10 @@ class EraController:
         self._last_applied_dt = time.time()
         ev = LockEvent(type="unlock", dt=time.time(), source="command",
                        method="remote", user_id=user_id)
-        # This HA command emits its own discrete unlock below; record its time so
-        # an inbound dp61 echo for the same command (device frame_t ~= now) is
-        # coalesced away rather than double-counted (device-time is wall-clock).
-        self._last_unlock_discrete_dt = ev.dt
+        # This HA command emits its own discrete unlock below; its time is
+        # recorded (in _emit_event) so an inbound dp61 echo for the same command
+        # (device frame_t ~= now) is coalesced away rather than double-counted
+        # (device-time is wall-clock).
         self._transition(UNLOCKED, "Unlocked in Home Assistant", user_id=user_id,
                          cause_event=ev, discrete="unlock")
         self._start_relock()

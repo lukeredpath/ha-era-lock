@@ -199,8 +199,10 @@ class EraMqttListener:
             if dp_id in dpmap.METHOD_DP_LABELS:
                 cred_id = _dp_value(raw)
                 method = dpmap.METHOD_DP_LABELS[dp_id]
-                who = dpmap.attribute(dp_id, cred_id if cred_id is not None else 0,
-                                      self._roster)
+                # ``who`` is the roster NAME only (None when unrostered); the
+                # raw "method #id" fallback is the controller's to render.
+                who = (self._roster.get((dp_id, cred_id))
+                       if cred_id is not None else None)
                 unlock_dt = tmap.get(str(dp_id), frame_t)
                 unlocked = True
         if unlocked:

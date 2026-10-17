@@ -25,15 +25,23 @@ Wi-Fi hub and fronted by ERA's cloud. Installable via [HACS](https://hacs.xyz/).
   device-time-ordered engine that is robust to the BLE lock's buffered,
   replayed-on-wake event stream:
   - captures the device's *own* lock signal (`dp11`) by polling for it in the
-    seconds after an unlock → **"Device Locked"** (covers both the ~30s auto-lock
+    seconds after an unlock → **"Device locked"** (covers both the ~30s auto-lock
     and a manual handle-lift), with a 60s failsafe timer as a backstop;
   - shows a transient **"Unlocking…"** state during the cloud round-trip;
-  - with an optional **door-contact sensor**, infers a manual **thumbturn**
-    unlock (the door can't open while deadbolt-locked, so open-while-locked ⇒
-    unlocked) and schedules a re-sync ~1 min after an exit to catch a lock-up
-    done just after the door shut;
-  - records the **cause** of every transition (shown in the activity log) and
-    whether each state was **device-confirmed or inferred**.
+  - with an optional **door-contact sensor**, open-while-locked ⇒ unlocked at
+    once (the door can't open while deadbolt-locked); it then waits ~10s for the
+    lock's buffered events and credits the fingerprint/card that unlocked it,
+    or infers the manual **thumbturn** if none turns up. It also schedules a
+    re-sync ~1 min after an exit to catch a lock-up done just after the door shut;
+  - writes **one rich activity-log line per thing that happened** — *Unlocked by
+    Luke (fingerprint)*, *Unlocked (fingerprint #2)*, *Unlocked in Home
+    Assistant*, *Auto-locked (timer)*, *Failed fingerprint attempt*, ... — even
+    when a buffered flush nets the state change away; the lock's own state rows
+    are linked to (shown as caused by) that line, and it records whether each
+    state was **device-confirmed or inferred**.
+- **`event`** — **Activity**: a discrete event per unlock/lock/failed
+  unlock/tamper/door (`event_type` + `method`/`credential_id`/`user`/`label`/
+  `description` attributes) for automations.
 - **`sensor`** — battery %.
 - **`button`** — **Sync**: force the BLE lock to wake and report, flushing any
   buffered events (use sparingly — waking the lock costs battery).

@@ -5,11 +5,16 @@ from homeassistant.const import Platform
 
 DOMAIN = "era_lock"
 
-# Fired (with a context) as the parent of each lock state change so the activity
-# log's "what happened" shows the cause; described in logbook.py.
+# Fired once per discrete activity (unlock/lock/failed_unlock/tamper/door) with
+# the activity's cause context; described in logbook.py as the activity log's
+# single rich line ("Unlocked by Luke (fingerprint)"). The lock + event entity
+# state changes for the same activity share / parent to that context.
+EVENT_ACTIVITY = "era_lock_activity"
+# LEGACY: the per-state-change cause event fired by earlier versions. No longer
+# fired; still described so already-recorded history keeps rendering.
 EVENT_CAUSE = "era_lock_cause"
-# Name shown on the cause/annotation logbook rows, kept distinct from the lock
-# entity's own name so the two don't read as the same source.
+# Logbook source name for the activity rows (shown e.g. as "via <name>" on rows
+# whose cause is an activity), kept distinct from the lock entity's own name.
 CAUSE_SOURCE = "ERA Protect Lock Activity"
 
 PLATFORMS: list[Platform] = [

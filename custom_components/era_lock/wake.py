@@ -82,8 +82,11 @@ class EraWakeManager:
         self._poll_unsubs.clear()
 
     @callback
-    def on_door_change(self) -> None:
-        self._wake("door event")
+    def on_door_change(self, force: bool = False) -> None:
+        """Wake on a door change. ``force`` bypasses the rate limit — used for a
+        door opening while the lock is believed locked, whose unlock attribution
+        is held waiting for the buffered flush this wake triggers."""
+        self._wake("door event", force=force)
 
     @callback
     def schedule_followup(self, delay: float = POST_CLOSE_SYNC_S) -> None:
