@@ -19,7 +19,7 @@
     },
     "binary_sensor": {
       "connected": {
-        "name": "Connected"
+        "name": "Connection"
       }
     }
   },
