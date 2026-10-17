@@ -612,7 +612,13 @@ class EraController:
     @callback
     def _on_door(self, event: Event) -> None:
         new = event.data.get("new_state")
-        if new is None:
+        old = event.data.get("old_state")
+        if new is None or new.state not in ("on", "off"):
+            return
+        # Only a real open/close transition counts. The sensor's first state
+        # write at startup (or recovery from unavailable/unknown) isn't the door
+        # moving — treating it as a close set HA to "unlocked" on every boot.
+        if old is None or old.state not in ("on", "off"):
             return
         opened_from_locked = new.state == "on" and self._state == LOCKED
         if self.coordinator.wake is not None:
@@ -653,7 +659,11 @@ class EraController:
             # arrives as dp11 on the wake this close triggers. Don't clobber a
             # more specific unlock reason (e.g. thumbturn) already set.
             self._cancel_relock()
-            if self._state != UNLOCKED:
+            # Only resolve an UNKNOWN state here. Never override LOCKED: the door
+            # can't shut with the bolts thrown, so a lock reported while the
+            # door was "open" (stale state / mis-synced sensor) is the device's
+            # word and wins over the inference.
+            if self._state is None:
                 ev = LockEvent(type="door", dt=time.time(), source="door",
                                subtype="close")
                 self._transition(UNLOCKED, "Door closed", inferred=True,
