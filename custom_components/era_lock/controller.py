@@ -62,6 +62,13 @@ _LOGGER = logging.getLogger(__name__)
 LOCKED = "locked"
 UNLOCKED = "unlocked"
 DEVICE_DEBOUNCE_S = 2.0  # coalesce dp11 mini-history bursts into one transition
+# A single remote/app unlock is reported as TWO separate MQTT frames ~1s apart
+# with the SAME device-time: the dp61 "AEkA" transport echo (method="remote", no
+# credential) and a method DP (dp62 phone_remote / dp12 fingerprint / ...) that
+# carries the real attribution. Coalesce discrete unlock events whose device-times
+# fall within this window into ONE physical unlock; a real method DP beats the bare
+# "remote" echo (see _emit_unlock_discrete). Unlocks further apart stay distinct.
+UNLOCK_COALESCE_S = 2.0
 
 
 class EraController:
@@ -85,6 +92,10 @@ class EraController:
         self._pending: LockEvent | None = None
         self._pending_ctx_id: str | None = None  # ctx of the pending event's activity row
         self._device_debounce = None
+        # -- unlock-event coalescing (dp61 echo + method DP -> one event) -----
+        self._unlock_echo = None            # buffered (ev, ctx_id, user_id) echo
+        self._unlock_echo_cancel = None     # its flush timer
+        self._last_unlock_discrete_dt: float | None = None  # dt of last unlock emitted
         self._exit_pending: bool = False  # locked->thumbturn-open awaiting a close
         self._relock_cancel = None
         self._logged_state: str | None = "__init__"  # cause/logbook de-dupe
@@ -128,6 +139,7 @@ class EraController:
             self._unsub_door = None
         self._cancel_relock()
         self._cancel_device_debounce()
+        self._cancel_unlock_echo()
 
     # -- transition + outputs -------------------------------------------------
     @callback
@@ -204,6 +216,67 @@ class EraController:
             "cause_ctx_id": cause_ctx_id,
         })
 
+    # -- unlock-event coalescing ----------------------------------------------
+    @callback
+    def _emit_unlock_discrete(
+        self, ev: LockEvent, ctx_id: str | None, user_id: str | None,
+    ) -> None:
+        """Emit exactly one discrete ``unlock`` event per physical unlock.
+
+        A single remote/app unlock reaches us as TWO ``unlock`` LockEvents from
+        two separate MQTT frames ~1s apart with the SAME device-time: the dp61
+        ``AEkA`` transport echo (``method="remote"``, no credential) and a method
+        DP (dp62 phone_remote / dp12 fingerprint / ...) carrying the real
+        attribution. The listener only sees one frame at a time, so the coalesce
+        has to happen here, over the event stream.
+
+        Precedence: a real METHOD DP beats the bare ``remote`` echo.
+          * method DP -> emit immediately; drop a buffered echo for the same
+            unlock (its attribution is replaced), and a later echo for an
+            already-emitted unlock (within UNLOCK_COALESCE_S) is suppressed.
+          * echo -> hold for UNLOCK_COALESCE_S. A method DP arriving in that
+            window supersedes it (echo dropped); otherwise the echo is emitted,
+            so a lone/app-free dp61 remote unlock (no method DP) still surfaces.
+        Unlocks whose device-times are more than UNLOCK_COALESCE_S apart are
+        distinct physical unlocks and each emit.
+        """
+        if ev.method == "remote":  # the bare dp61 echo
+            if (self._last_unlock_discrete_dt is not None
+                    and abs(ev.dt - self._last_unlock_discrete_dt)
+                    <= UNLOCK_COALESCE_S):
+                return  # a method DP / command for this unlock already emitted
+            self._cancel_unlock_echo()
+            self._unlock_echo = (ev, ctx_id, user_id)
+            self._unlock_echo_cancel = async_call_later(
+                self.hass, UNLOCK_COALESCE_S, self._flush_unlock_echo)
+            return
+        # A real method DP: it wins outright.
+        if self._unlock_echo is not None:
+            if abs(ev.dt - self._unlock_echo[0].dt) <= UNLOCK_COALESCE_S:
+                self._cancel_unlock_echo()  # same unlock -> drop the echo
+            else:
+                self._flush_unlock_echo()   # older distinct echo -> let it out
+        self._last_unlock_discrete_dt = ev.dt
+        self._emit_event("unlock", ev, cause_ctx_id=ctx_id, user_id=user_id)
+
+    @callback
+    def _flush_unlock_echo(self, _now=None) -> None:
+        self._unlock_echo_cancel = None
+        pending = self._unlock_echo
+        if pending is None:
+            return
+        self._unlock_echo = None
+        ev, ctx_id, user_id = pending
+        self._last_unlock_discrete_dt = ev.dt
+        self._emit_event("unlock", ev, cause_ctx_id=ctx_id, user_id=user_id)
+
+    @callback
+    def _cancel_unlock_echo(self) -> None:
+        if self._unlock_echo_cancel is not None:
+            self._unlock_echo_cancel()
+            self._unlock_echo_cancel = None
+        self._unlock_echo = None
+
     # -- auto-relock timer ----------------------------------------------------
     @callback
     def _start_relock(self) -> None:
@@ -273,7 +346,9 @@ class EraController:
                 self._options.get(CONF_CREDENTIALS, []), ev.method, ev.cred)
             ev_user = ev.user_id or uid
             ctx_id = Context(user_id=ev_user).id
-            self._emit_event("unlock", ev, cause_ctx_id=ctx_id, user_id=ev_user)
+            # Coalesce the dp61 "remote" echo with its method DP so one physical
+            # unlock yields exactly one discrete event (see _emit_unlock_discrete).
+            self._emit_unlock_discrete(ev, ctx_id, ev_user)
         elif ev.type == "state_report" and ev.locked:
             ctx_id = Context().id
             self._emit_event("lock", ev, cause_ctx_id=ctx_id, user_id=None)
@@ -449,6 +524,10 @@ class EraController:
         self._last_applied_dt = time.time()
         ev = LockEvent(type="unlock", dt=time.time(), source="command",
                        method="remote", user_id=user_id)
+        # This HA command emits its own discrete unlock below; record its time so
+        # an inbound dp61 echo for the same command (device frame_t ~= now) is
+        # coalesced away rather than double-counted (device-time is wall-clock).
+        self._last_unlock_discrete_dt = ev.dt
         self._transition(UNLOCKED, "Unlocked in Home Assistant", user_id=user_id,
                          cause_event=ev, discrete="unlock")
         self._start_relock()
