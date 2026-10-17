@@ -5,8 +5,15 @@ authoritative lock state and relocks automatically, so state is inferred by the
 controller (see controller.py); this entity only renders ``signal_state`` updates
 and delegates lock/unlock commands to the controller.
 
-`assumed_state` is set, and the entity stays available without the local LAN
-poll (unlock rides cloud MQTT).
+`assumed_state` is set. Availability follows the controller's view of the
+lock's link (the hub reporting the lock offline makes it unavailable), not the
+local LAN poll (unlock rides cloud MQTT).
+
+Context linkage: every state row caused by an activity line parents to that
+line's context — rows from ``signal_state`` carry it, and a command's own
+completion write (the end of the "Unlocking…" spinner) re-asserts the context
+the controller returned, because HA drops an entity's context ~5s after it was
+set and the command can outlast that.
 """
 from __future__ import annotations
 
@@ -53,6 +60,7 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
         self._last_method: str | None = None
         self._last_user: str | None = None
         self._unlocking: bool = False  # transient "Unlocking…" UI state (local)
+        self._available: bool = True   # False while the hub reports the lock offline
 
     @property
     def _controller(self) -> EraController:
@@ -68,8 +76,9 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
 
     @property
     def available(self) -> bool:
-        # Unlock rides cloud MQTT, independent of the local LAN poll.
-        return True
+        # The controller's view of the lock's link (hub presence), independent
+        # of the local LAN poll — unlock rides cloud MQTT.
+        return self._available
 
     @property
     def is_locked(self) -> bool | None:
@@ -105,6 +114,7 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
         self._inferred = payload.get("inferred", True)
         self._last_method = payload.get("last_method")
         self._last_user = payload.get("last_user")
+        self._available = payload.get("available", True)
         cause_ctx_id = payload.get("cause_ctx_id")
         user_id = payload.get("user_id")
         # Attribute the state change to its cause event (parent) + HA user, so the
@@ -131,12 +141,19 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
     async def async_unlock(self, **kwargs: Any) -> None:
         # Show the transitioning ("Unlocking…") state immediately; the cloud
         # round-trip takes a second or two. The controller performs the actual
-        # transition, which comes back via signal_state.
+        # transition, which comes back via signal_state — while the spinner is
+        # still showing, so the visible "unlocked" row is THIS method's final
+        # write. Parent it to the activity line the controller emitted (also when
+        # the controller's state didn't change, e.g. already unlocked). If the
+        # unlock failed no activity was emitted: keep the service-call context.
         uid, name = await self._caller()
         self._unlocking = True
         self.async_write_ha_state()
+        cause_ctx_id: str | None = None
         try:
-            await self._controller.async_unlock(uid, name)
+            cause_ctx_id = await self._controller.async_unlock(uid, name)
         finally:
             self._unlocking = False
+            if cause_ctx_id:
+                self.async_set_context(Context(user_id=uid, parent_id=cause_ctx_id))
             self.async_write_ha_state()

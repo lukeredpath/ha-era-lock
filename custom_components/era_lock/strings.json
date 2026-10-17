@@ -10,7 +10,8 @@
               "lock": "Locked",
               "failed_unlock": "Failed unlock",
               "tamper": "Tamper",
-              "door": "Door"
+              "door": "Door",
+              "connectivity": "Connectivity"
             }
           }
         }

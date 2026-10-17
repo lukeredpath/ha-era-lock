@@ -84,6 +84,14 @@ def lock_message(source: str | None) -> str:
     return "Device locked"
 
 
+# Lock link state (see controller._set_online). While the hub reports the lock
+# offline, actions at the door are neither reported live nor buffered, so the
+# shown state can't be trusted until it reconnects.
+LOCK_OFFLINE = "Lock offline (state unknown)"
+LOCK_ONLINE = "Lock back online"
+ONLINE_UNCONFIRMED = "Lock back online (state unconfirmed)"
+
+
 def describe(
     etype: str, *, method: str | None = None, cred=None,
     source: str | None = None, subtype: str | None = None,
@@ -108,6 +116,8 @@ def describe(
         if subtype == "close":
             return "Door closed"
         return "Door"
+    if etype == "connectivity":
+        return LOCK_OFFLINE if subtype == "offline" else LOCK_ONLINE
     return etype.replace("_", " ").capitalize()
 
 
@@ -124,4 +134,6 @@ def icon(etype: str | None, method: str | None = None,
         return "mdi:alert"
     if etype == "door":
         return "mdi:door-open" if subtype == "open" else "mdi:door-closed"
+    if etype == "connectivity":
+        return "mdi:lan-disconnect" if subtype == "offline" else "mdi:lan-connect"
     return None

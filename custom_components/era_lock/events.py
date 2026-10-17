@@ -25,10 +25,13 @@ class LockEvent:
     """A normalised input event from any source.
 
     ``type``    one of ``state_report`` | ``unlock`` | ``failed_unlock`` |
-                ``tamper`` | ``door``.
+                ``tamper`` | ``door`` | ``connectivity``. A ``connectivity``
+                event is the hub's view of the lock's link (``value`` True =
+                reachable incl. asleep/"nearby", False = offline), from a
+                ``protocol:25`` presence or ``protocol:1`` connectStatus frame.
     ``dt``      device-time epoch for the event; for door/command/timer events
                 (which the device doesn't timestamp) the wall-clock ``time.time()``.
-    ``source``  ``device`` | ``command`` | ``door`` | ``timer``.
+    ``source``  ``device`` | ``command`` | ``door`` | ``timer`` | ``hub``.
     """
 
     type: str

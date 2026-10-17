@@ -50,6 +50,7 @@ from .const import (
 )
 from .eralock.mqtt import CloudMqttLock, MqttUnlockError
 from .events import LockEvent, signal_event, signal_raw, signal_state
+from .wake import POST_CLOSE_SYNC_S
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -91,16 +92,24 @@ DOOR_CLOCK_SLACK_S = 5.0
 # Unlock methods that can explain a door opening from locked. "remote" is the
 # bare dp61 echo — a lone echo is still a real remote unlock.
 DOOR_CAUSE_METHODS = ("fingerprint", "card", "ble", "phone_remote", "voice", "remote")
+# A device lock reported while a door hold is pending is one of two things:
+#   - a buffered relock from BEFORE the open (device-time < open): it disqualifies
+#     the credentials before it (see _pick_door_cause) and the hold carries on;
+#   - a lock-up AFTER the open (closed the door, lifted the handle): the unlock
+#     that the hold represents happened first, so the hold is resolved BEFORE the
+#     lock's activity line is emitted (the log must never read lock -> unlock).
+# See _lock_after_open for the boundary.
 
 
 class _DoorHold:
     """A door-open-from-locked whose unlock attribution is being held."""
 
-    __slots__ = ("ctx_id", "open_t", "candidates", "lock_dts", "cancel")
+    __slots__ = ("ctx_id", "open_t", "closed_t", "candidates", "lock_dts", "cancel")
 
     def __init__(self, ctx_id: str, open_t: float) -> None:
         self.ctx_id = ctx_id          # reserved cause ctx (state already parents to it)
         self.open_t = open_t          # wall-clock time the door opened
+        self.closed_t: float | None = None  # wall-clock close while held (None = open)
         self.candidates: list[tuple[LockEvent, str | None]] = []
         self.lock_dts: list[float] = []  # device locks seen in the lookback
         self.cancel = None
@@ -165,7 +174,13 @@ class EraController:
         # hold). None otherwise.
         self._attributable_ctx_id: str | None = None
         self._door_hold: _DoorHold | None = None  # door-open-from-locked hold
-        self._exit_pending: bool = False  # locked->thumbturn-open awaiting a close
+        # A door-open-from-locked RESOLVED as a thumbturn exit while the door is
+        # still open: the close arms the post-close re-sync.
+        self._exit_pending: bool = False
+        # The hub's view of the lock's link. While offline, actions at the door
+        # are neither reported nor buffered, so the state can't be trusted: the
+        # lock entity goes unavailable (see _set_online).
+        self._online: bool = True
         self._relock_cancel = None
         self._logged_state: str | None = "__init__"  # state-change de-dupe
         # -- subscriptions ----------------------------------------------------
@@ -219,7 +234,7 @@ class EraController:
         self, state: str | None, reason: str, *, inferred: bool = False,
         user_id: str | None = None, cause_event: LockEvent | None = None,
         discrete: str | None = None, cause_ctx_id: str | None = None,
-    ) -> None:
+    ) -> str | None:
         """Change state and attribute it to the event that caused it.
 
         Pass ``cause_ctx_id`` when the discrete activity event was (or will be)
@@ -227,20 +242,26 @@ class EraController:
         unlock on resolution — or ``discrete`` + ``cause_event`` for a direct
         transition (command, timer) whose discrete event is published here.
         The discrete event is ALWAYS published when given (so an HA unlock while
-        already unlocked still gets its activity line); the state change
-        parents to the cause context only when the state actually changes
-        (de-dupe by ``_logged_state``), so the lock's "-> unlocked" row is shown
-        "triggered by" / "By <user>" its activity line. ``inferred`` marks a
-        state HA deduced (door sensor, relock timer, manual assertion)."""
+        already unlocked still gets its activity line), and the state publish
+        then ALWAYS parents to its context — even when the controller's state
+        doesn't change, the entity's visible row may (an HA unlock's spinner
+        unlocking -> unlocked), and it must link to the activity line. Without
+        an emitted activity, the publish parents to ``cause_ctx_id`` (or a fresh
+        context) only when the state actually changes (de-dupe by
+        ``_logged_state``); a repeat keeps the entity's existing context.
+        ``inferred`` marks a state HA deduced (door sensor, relock timer, manual
+        assertion). Returns the context id the publish parented to, if any."""
         self._changed_by = reason
         self._inferred = inferred
         _LOGGER.debug("lock -> %s  (%s)%s", state or "unknown", reason,
                       " [inferred]" if inferred else "")
+        emitted = False
         if discrete and cause_event is not None:
             if cause_ctx_id is None:
                 cause_ctx_id = Context(user_id=user_id).id
             self._emit_event(discrete, cause_event,
                              cause_ctx_id=cause_ctx_id, user_id=user_id)
+            emitted = True
         if state != self._logged_state:
             self._logged_state = state
             self._attributable_ctx_id = None
@@ -248,10 +269,11 @@ class EraController:
                 # No activity behind this change (e.g. a bare dp11 sync): still
                 # give the state row a fresh context so it can't inherit one.
                 cause_ctx_id = Context(user_id=user_id).id
-        else:
+        elif not emitted:
             cause_ctx_id = None  # repeat of the same logged state: no new cause
         self._state = state
         self._publish_state(cause_ctx_id, user_id)
+        return cause_ctx_id
 
     @callback
     def _publish_state(self, cause_ctx_id: str | None, user_id: str | None) -> None:
@@ -263,6 +285,7 @@ class EraController:
             "last_user": self._last_user,
             "cause_ctx_id": cause_ctx_id,
             "user_id": user_id,
+            "available": self._online,
         })
 
     @callback
@@ -448,6 +471,13 @@ class EraController:
     def _on_raw(self, ev: LockEvent) -> None:
         if not isinstance(ev, LockEvent):
             return
+        if ev.type == "connectivity":
+            self._set_online(bool(ev.value))
+            return
+        if ev.source == "device" and not self._online:
+            # The lock is evidently talking again (a DP frame), whether or not
+            # the hub's presence frame has arrived yet.
+            self._set_online(True)
         if ev.type in ("state_report", "unlock"):
             self._on_push_state(ev)
         elif ev.type in ("failed_unlock", "tamper"):
@@ -455,6 +485,38 @@ class EraController:
             # own root context (no HA user).
             cause = Context()
             self._emit_event(ev.type, ev, cause_ctx_id=cause.id, user_id=None)
+
+    @callback
+    def _set_online(self, online: bool) -> None:
+        """Track the hub's view of the lock's link (transitions only — the hub
+        repeats presence, and protocol:25 + protocol:1 report the same change).
+
+        Offline is surfaced as the lock entity going UNAVAILABLE, not as a kept
+        state with a flag: actions at the door while offline are neither
+        reported nor buffered (a later sync returns nothing), so the last known
+        "locked" is exactly the confident-but-wrong answer to avoid; HA also
+        refuses service calls to an unavailable entity, which matches reality
+        (a cloud unlock can't reach an offline lock). The Sync button stays
+        available to retry. Each transition gets an activity line ("Lock
+        offline (state unknown)" / "Lock back online") that the entity's
+        unavailable / restored row parents to. On reconnect the last known
+        state is restored but marked inferred (it may have changed unseen) and
+        a sync is forced."""
+        if online == self._online:
+            return
+        self._online = online
+        _LOGGER.debug("lock link -> %s", "online" if online else "OFFLINE")
+        ev = LockEvent(type="connectivity", dt=time.time(), source="hub",
+                       subtype="online" if online else "offline", value=online)
+        ctx_id = Context().id
+        self._emit_event("connectivity", ev, cause_ctx_id=ctx_id, user_id=None)
+        if online:
+            self._inferred = True
+            if self._state is not None:
+                self._changed_by = activity.ONLINE_UNCONFIRMED
+            if self.coordinator.wake is not None:
+                self.coordinator.wake.on_reconnect()
+        self._publish_state(ctx_id, None)
 
     @callback
     def _on_push_state(self, ev: LockEvent) -> None:
@@ -491,8 +553,18 @@ class EraController:
                 ctx_id = self._emit_unlock_discrete(
                     ev, Context(user_id=ev_user).id, ev_user)
         elif ev.type == "state_report" and ev.locked:
-            if hold is not None and hold.in_window(ev.dt):
-                hold.lock_dts.append(ev.dt)
+            if hold is not None:
+                if self._lock_after_open(hold, ev):
+                    # The door was unlocked (and opened) before this lock-up:
+                    # settle the held unlock FIRST so its line precedes this one.
+                    self._resolve_door_hold(by_lock=True)
+                elif hold.in_window(ev.dt):
+                    # A buffered relock from before the open: it disqualifies
+                    # the credentials before it, which can be logged now (ahead
+                    # of this lock line, in device order).
+                    hold.lock_dts.append(ev.dt)
+                    self._emit_held_unlocks(
+                        hold, [c for c in hold.candidates if c[0].dt < ev.dt])
             ctx_id = Context().id
             self._emit_event("lock", ev, cause_ctx_id=ctx_id, user_id=None)
 
@@ -505,7 +577,10 @@ class EraController:
             elif ev.type == "state_report" and ev.locked:
                 self._cancel_relock()
                 if self.coordinator.wake is not None:
-                    self.coordinator.wake.cancel_polls()  # real lock seen; stop polling
+                    # real lock seen: stop polling for it, and a pending
+                    # post-close re-sync (looking for this lock-up) is moot.
+                    self.coordinator.wake.cancel_polls()
+                    self.coordinator.wake.cancel_followup()
 
         # Ordered + debounced state application: the latest device-time wins, so a
         # buffered flush settles on the lock's real final state (no flicker, and
@@ -637,7 +712,9 @@ class EraController:
                 # eventual unlock event (credential, else thumbturn) is emitted
                 # under.
                 self._resolve_door_hold()  # settle any earlier hold first
-                self._exit_pending = True  # arm the post-close re-sync
+                # The post-close re-sync is armed only once the hold resolves
+                # as a thumbturn exit (see _resolve_door_hold).
+                self._exit_pending = False
                 self._last_method = None   # unknown until the hold resolves
                 self._last_user = None
                 hold = _DoorHold(Context().id, time.time())
@@ -649,6 +726,8 @@ class EraController:
                 self._attributable_ctx_id = hold.ctx_id
             else:
                 self._exit_pending = False
+                if self._door_hold is not None:
+                    self._door_hold.closed_t = None  # reopened before resolving
                 if self._state != UNLOCKED:
                     ev = LockEvent(type="door", dt=time.time(), source="door",
                                    subtype="open")
@@ -668,20 +747,68 @@ class EraController:
                                subtype="close")
                 self._transition(UNLOCKED, "Door closed", inferred=True,
                                  cause_event=ev, discrete="door")
-            if self._exit_pending:
-                # locked -> thumbturn-open -> close: somebody likely left, and a
-                # lock-up tends to happen in the first minute. Re-sync then to
-                # catch it (the immediate close wake fires too early to see it).
+            if self._door_hold is not None:
+                # Closed before the hold resolved: whether this was an exit
+                # isn't known yet — _resolve_door_hold decides (relative to now).
+                self._door_hold.closed_t = time.time()
+            elif self._exit_pending:
                 self._exit_pending = False
-                if self.coordinator.wake is not None:
-                    self.coordinator.wake.schedule_followup()
+                self._schedule_exit_resync(time.time())
 
     @callback
-    def _resolve_door_hold(self, _now=None) -> None:
+    def _schedule_exit_resync(self, closed_t: float) -> None:
+        """locked -> thumbturn-open -> close: somebody likely left, and a
+        lock-up tends to happen in the first minute. Re-sync POST_CLOSE_SYNC_S
+        after the close to catch it (the immediate close wake fires too early).
+        Only for a thumbturn EXIT — a credential open is someone coming in."""
+        if self.coordinator.wake is not None:
+            self.coordinator.wake.schedule_followup(
+                max(0.0, closed_t + POST_CLOSE_SYNC_S - time.time()))
+
+    def _lock_after_open(self, hold: _DoorHold, ev: LockEvent) -> bool:
+        """Is a device lock reported during ``hold`` a lock-up AFTER the open
+        (vs a buffered relock from before it)? After, if its device-time is at
+        or past the open; once the door has closed again, also within the clock
+        slack before it (the device clock may lag HA's) — a lock-up after the
+        close is then far likelier than a relock seconds before the open."""
+        if ev.dt >= hold.open_t:
+            return True
+        return (hold.closed_t is not None
+                and ev.dt >= hold.open_t - DOOR_CLOCK_SLACK_S)
+
+    @callback
+    def _emit_held_unlocks(
+        self, hold: _DoorHold, cands: list[tuple[LockEvent, str | None]],
+    ) -> None:
+        """Emit collected credential unlocks that do NOT explain the open (each
+        a genuine earlier unlock, with its own context), in device order, and
+        drop them from the hold. A dp61 echo of a collected method DP is
+        dropped silently."""
+        everything = list(hold.candidates)
+        for ev, user in sorted(cands, key=lambda c: c[0].dt):
+            if ev.method != "remote" or not any(
+                    o is not ev and o.method != "remote"
+                    and abs(o.dt - ev.dt) <= UNLOCK_COALESCE_S
+                    for o, _u in everything):
+                self._emit_event("unlock", ev,
+                                 cause_ctx_id=Context(user_id=user).id,
+                                 user_id=user)
+        drop = {id(c[0]) for c in cands}
+        hold.candidates = [c for c in hold.candidates if id(c[0]) not in drop]
+
+    @callback
+    def _resolve_door_hold(self, _now=None, *, by_lock: bool = False) -> None:
         """Settle a held door-open: emit ONE unlock under the hold's context —
         the credential unlock that explains it, else the thumbturn. Credential
         unlocks collected but not chosen (disqualified by an intervening device
-        lock) are genuine earlier unlocks and are emitted as their own events."""
+        lock) are genuine earlier unlocks and are emitted as their own events,
+        first.
+
+        ``by_lock``: resolved early by a device lock-up after the open (the
+        caller emits that lock's line next). A thumbturn result otherwise means
+        someone left: arm the post-close re-sync — timed from the close if the
+        door already shut during the hold, else on the coming close. A lock-up
+        already seen makes the re-sync moot."""
         hold = self._door_hold
         if hold is None:
             return
@@ -690,27 +817,29 @@ class EraController:
             hold.cancel()
             hold.cancel = None
         winner = _pick_door_cause(hold.candidates, hold.lock_dts, hold.open_t)
-        for ev, user in sorted(hold.candidates, key=lambda c: c[0].dt):
-            if winner is not None and ev is winner[0]:
-                continue
-            if ev.method == "remote" and any(
-                    o is not ev and o.method != "remote"
-                    and abs(o.dt - ev.dt) <= UNLOCK_COALESCE_S
-                    for o, _u in hold.candidates):
-                continue  # dp61 echo of a collected method DP
-            self._emit_event("unlock", ev, cause_ctx_id=Context(user_id=user).id,
-                             user_id=user)
+        self._emit_held_unlocks(
+            hold, [c for c in hold.candidates
+                   if winner is None or c[0] is not winner[0]])
         if winner is not None:
             ev, user = winner
         else:
             ev, user = LockEvent(type="unlock", dt=hold.open_t, source="door",
                                  method="thumbturn"), None
-        _LOGGER.debug("door hold resolved: %s", ev.method)
+        _LOGGER.debug("door hold resolved: %s%s", ev.method,
+                      " (by lock-up)" if by_lock else "")
         self._emit_event("unlock", ev, cause_ctx_id=hold.ctx_id, user_id=user)
         self._refine_unlock(hold.ctx_id, ev)
+        self._exit_pending = False
+        if winner is None and not by_lock:
+            if hold.closed_t is not None:
+                self._schedule_exit_resync(hold.closed_t)
+            else:
+                self._exit_pending = True  # door still open: arm on the close
 
     # -- commands (called by the lock entity, which resolves the caller) ------
-    async def async_lock(self, user_id: str | None) -> None:
+    # Both commands return the context id of the activity line they emitted, so
+    # the lock entity parents its own command-completion state write to it.
+    async def async_lock(self, user_id: str | None) -> str | None:
         # No hardware lock command (the lock auto-relocks), so this is a manual
         # "mark as locked" to assert the secured state the silent mechanical
         # thumbturn doesn't report.
@@ -718,10 +847,13 @@ class EraController:
         self._last_applied_dt = time.time()
         ev = LockEvent(type="state_report", dt=time.time(), source="command",
                        locked=True)
-        self._transition(LOCKED, activity.lock_message("command"), inferred=True,
-                         user_id=user_id, cause_event=ev, discrete="lock")
+        return self._transition(
+            LOCKED, activity.lock_message("command"), inferred=True,
+            user_id=user_id, cause_event=ev, discrete="lock")
 
-    async def async_unlock(self, user_id: str | None, user_name: str | None) -> None:
+    async def async_unlock(
+        self, user_id: str | None, user_name: str | None,
+    ) -> str | None:
         await self.hass.async_add_executor_job(self._unlock)
         self._last_method = "remote"
         self._last_user = user_name or "Home Assistant"
@@ -732,8 +864,9 @@ class EraController:
         # recorded (in _emit_event) so an inbound dp61 echo for the same command
         # (device frame_t ~= now) is coalesced away rather than double-counted
         # (device-time is wall-clock).
-        self._transition(UNLOCKED, "Unlocked in Home Assistant", user_id=user_id,
-                         cause_event=ev, discrete="unlock")
+        ctx_id = self._transition(
+            UNLOCKED, "Unlocked in Home Assistant", user_id=user_id,
+            cause_event=ev, discrete="unlock")
         self._start_relock()
         # Poll for the lock's own auto-lock (dp11) before the failsafe timer; we
         # know we unlocked, so arm the polls here rather than waiting on an
@@ -741,6 +874,7 @@ class EraController:
         if self.coordinator.wake is not None:
             self.coordinator.wake.on_unlock()
         await self.coordinator.async_request_refresh()
+        return ctx_id
 
     def _unlock(self) -> None:
         mgr = self.coordinator.mgr

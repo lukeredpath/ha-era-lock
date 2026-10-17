@@ -34,7 +34,7 @@ from .events import signal_event
 
 _LOGGER = logging.getLogger(__name__)
 
-EVENT_TYPES = ["unlock", "lock", "failed_unlock", "tamper", "door"]
+EVENT_TYPES = ["unlock", "lock", "failed_unlock", "tamper", "door", "connectivity"]
 _DEDUPE_MAX = 128
 
 
@@ -78,7 +78,8 @@ class EraLockEventEntity(EventEntity):
         if etype not in EVENT_TYPES:
             return
 
-        key = (etype, payload.get("dt"), payload.get("method"), payload.get("cred"))
+        key = (etype, payload.get("dt"), payload.get("method"), payload.get("cred"),
+               payload.get("subtype"))
         if key in self._seen:
             return
         if len(self._seen_order) == _DEDUPE_MAX:

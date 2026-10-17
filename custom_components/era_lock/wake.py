@@ -10,7 +10,9 @@ wake only at worthwhile moments:
   - when a configured door contact opens or closes;
   - on an idle heartbeat (no contact for a configurable interval; 0 = off);
   - plus the Sync button.
-Non-poll wakes are rate-limited (MIN_WAKE_GAP) for battery.
+Non-poll wakes are rate-limited (MIN_WAKE_GAP) for battery. Forced wakes bypass
+that limit but are still coalesced: one sent within FORCED_WAKE_COALESCE_S of the
+previous wake is merged into it (see _wake).
 """
 from __future__ import annotations
 
@@ -26,6 +28,13 @@ _LOGGER = logging.getLogger(__name__)
 MIN_WAKE_GAP = 20.0  # minimum seconds between non-poll forced wakes (battery)
 WAKE_POLL_OFFSETS = (30, 40, 50)  # seconds after an unlock to poll for auto-lock
 POST_CLOSE_SYNC_S = 60  # after a thumbturn-exit close, re-sync to catch a lock-up
+# A forced wake within this many seconds of the previous wake is merged into it.
+# A dp54 synch makes the lock reconnect and flush within ~3s, and it then stays
+# connected (reporting live) for a while, so a second synch inside that window
+# can't fetch anything the first won't. 5s covers the flush with headroom, yet is
+# well under the 10s spacing of the relock polls, so the polls never merge with
+# each other — only with an unrelated wake that has just done the same job.
+FORCED_WAKE_COALESCE_S = 5.0
 
 
 class EraWakeManager:
@@ -36,7 +45,7 @@ class EraWakeManager:
         self._listener = listener
         self._heartbeat_s = heartbeat_s
         self._last_inbound = time.monotonic()
-        self._last_wake = 0.0
+        self._last_wake = float("-inf")  # no wake sent yet
         self._heartbeat_unsub = None
         self._poll_unsubs: list = []
         self._followup_unsub = None
@@ -103,10 +112,21 @@ class EraWakeManager:
         self._followup_unsub = async_call_later(self.hass, delay, _fire)
 
     @callback
+    def cancel_followup(self) -> None:
+        """Drop a pending post-close re-sync (a live lock-up was already seen)."""
+        self._cancel_followup()
+
+    @callback
     def _cancel_followup(self) -> None:
         if self._followup_unsub is not None:
             self._followup_unsub()
             self._followup_unsub = None
+
+    @callback
+    def on_reconnect(self) -> None:
+        """The hub reports the lock reachable again after being offline: sync
+        once to pick up anything it reports on reconnect."""
+        self._wake("lock back online", force=True)
 
     @callback
     def request_wake(self, reason: str = "manual") -> None:
@@ -120,8 +140,14 @@ class EraWakeManager:
 
     def _wake(self, reason: str, force: bool = False) -> None:
         now = time.monotonic()
-        if not force and now - self._last_wake < MIN_WAKE_GAP:
+        since = now - self._last_wake
+        if not force and since < MIN_WAKE_GAP:
             _LOGGER.debug("wake suppressed (rate limit): %s", reason)
+            return
+        if force and since < FORCED_WAKE_COALESCE_S:
+            # e.g. the +60s post-close re-sync and a +30s relock poll landing
+            # together: the wake already in flight flushes the same data.
+            _LOGGER.debug("wake merged into one %.1fs ago: %s", since, reason)
             return
         self._last_wake = now
         _LOGGER.debug("wake: %s", reason)

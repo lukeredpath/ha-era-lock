@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import time
 
 import paho.mqtt.client as mqtt
 from homeassistant.core import HomeAssistant, callback
@@ -86,6 +87,9 @@ class EraMqttListener:
         # reuse CloudMqttLock purely for cid / topics / frame decryption
         self._helper = CloudMqttLock(combined, mgr.mqtt_secrets())
         self._roster = dpmap.roster_from_config(combined)
+        # The lock's Tuya devId (optional config): protocol:1 connectStatus frames
+        # name the device by devId, not by the sub-device cid.
+        self._lock_dev_id = combined.get("lock_id")
         self._client: mqtt.Client | None = None
         self._closing = False
         self._wake_manager = None  # set via set_wake_manager()
@@ -162,6 +166,13 @@ class EraMqttListener:
         data = obj.get("data")
         if not isinstance(data, dict):
             return
+        proto = obj.get("protocol")
+        if proto == 25:
+            self._handle_presence(data, obj.get("t"))
+            return
+        if proto == 1:
+            self._handle_connect_status(data, obj.get("t"))
+            return
         dps = data.get("dps")
         if data.get("cid") != self._helper.cid or not isinstance(dps, dict):
             return
@@ -233,6 +244,50 @@ class EraMqttListener:
             self._emit(LockEvent(
                 type="tamper", subtype="hijack", dt=dt, fresh=fresh,
                 source="device"))
+
+    # -- link state (hub's view of the BLE lock) -------------------------------
+    def _handle_presence(self, data: dict, frame_t) -> None:
+        """protocol:25 — the hub's sub-device presence list:
+        ``{"online": [cid..], "offline": [cid..], "nearby": [cid..]}``. "nearby"
+        is the lock asleep within BLE range (normal; it's listed alongside
+        "online"), so only an ``offline`` listing counts as offline. A frame that
+        doesn't mention our cid says nothing about it."""
+        cid = self._helper.cid
+
+        def has(key) -> bool:
+            v = data.get(key)
+            return isinstance(v, list) and cid in v
+
+        if has("online") or has("nearby"):
+            online = True
+        elif has("offline"):
+            online = False
+        else:
+            return
+        self._emit_link(online, frame_t, "presence")
+
+    def _handle_connect_status(self, data: dict, frame_t) -> None:
+        """protocol:1 — a device's connection status, keyed by Tuya devId:
+        ``connectStatus`` 1 = connected/awake, 2 = asleep but nearby (normal),
+        0 = offline; ``online`` mirrors it. Only matched when the lock's devId
+        (``lock_id``) is configured; protocol:25 covers it otherwise."""
+        if not self._lock_dev_id or data.get("devId") != self._lock_dev_id:
+            return
+        status = data.get("connectStatus")
+        flag = data.get("online")
+        if status == 0 or flag is False:
+            online = False
+        elif status in (1, 2) or flag is True:
+            online = True
+        else:
+            return
+        self._emit_link(online, frame_t, "connectStatus")
+
+    def _emit_link(self, online: bool, frame_t, via: str) -> None:
+        self._emit(LockEvent(
+            type="connectivity", value=online, subtype=via,
+            dt=frame_t if isinstance(frame_t, (int, float)) else time.time(),
+            source="hub"))
 
     def _emit(self, event: LockEvent) -> None:
         self.hass.loop.call_soon_threadsafe(
