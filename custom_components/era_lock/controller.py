@@ -102,6 +102,40 @@ DOOR_CAUSE_METHODS = ("fingerprint", "card", "ble", "phone_remote", "voice", "re
 #     lock's activity line is emitted (the log must never read lock -> unlock).
 # See _lock_after_open for the boundary.
 
+# An HA unlock rides the listener's own MQTT connection, so the listener HEARS
+# the lock's response to our command: the dp61 "AEkA" echo (often before the
+# command even returns — it is what confirms it) and ~100ms-1s later the dp62
+# phone_remote method DP (cred 0), plus a bare dp11:false. Those are our echo,
+# not a second (app) unlock. A remote-type unlock is absorbed into the HA unlock
+# while the command is in flight and for HA_ECHO_GRACE_S after it returns.
+# 5s: >2x the UNLOCK_COALESCE_S dp61/dp62 pairing window and comfortably past
+# the observed ~100ms dp62 lag plus broker/loop latency, while an INDEPENDENT
+# app unlock of an already-unlocking door within 5s of an HA unlock is
+# implausible (and, if it happened, costs only one redundant line). Only
+# remote-type methods are echoes: a fingerprint/card/BLE unlock in the window is
+# a real, separate action. "voice" is excluded too — HA's command never
+# produces it, so a voice unlock is always someone else.
+HA_ECHO_GRACE_S = 5.0
+HA_ECHO_METHODS = ("remote", "phone_remote")
+
+
+class _HaUnlock:
+    """An HA unlock command: in flight, then its echo grace window."""
+
+    __slots__ = ("ctx_id", "user_id", "user_name", "start_t", "end_t",
+                 "emitted", "echoed", "ev")
+
+    def __init__(self, ctx_id: str, user_id: str | None, user_name: str,
+                 start_t: float) -> None:
+        self.ctx_id = ctx_id        # reserved ctx: the ONE activity line + state
+        self.user_id = user_id
+        self.user_name = user_name
+        self.start_t = start_t      # wall-clock before the command was published
+        self.end_t: float | None = None  # wall-clock the command returned/raised
+        self.emitted = False        # its "Unlocked in Home Assistant" line is out
+        self.echoed = False         # the lock reported an unlock for it
+        self.ev: LockEvent | None = None  # the emitted command LockEvent
+
 
 class _DoorHold:
     """A door-open-from-locked whose unlock attribution is being held."""
@@ -176,6 +210,7 @@ class EraController:
         # hold). None otherwise.
         self._attributable_ctx_id: str | None = None
         self._door_hold: _DoorHold | None = None  # door-open-from-locked hold
+        self._ha_unlock: _HaUnlock | None = None  # latest HA unlock (see HA_ECHO_GRACE_S)
         # A door-open-from-locked RESOLVED as a thumbturn exit while the door is
         # still open: the close arms the post-close re-sync.
         self._exit_pending: bool = False
@@ -428,6 +463,35 @@ class EraController:
             self._unlock_echo_cancel = None
         self._unlock_echo = None
 
+    # -- HA unlock echo absorption ---------------------------------------------
+    def _ha_echo(self, ev: LockEvent) -> _HaUnlock | None:
+        """The HA unlock whose own echo ``ev`` is, if any: a live remote-type
+        unlock reported while the command is in flight or within
+        HA_ECHO_GRACE_S after it returned. Buffered replays (the wake can flush
+        history) predate the command and are never absorbed."""
+        rec = self._ha_unlock
+        if (rec is None or ev.type != "unlock" or ev.method not in HA_ECHO_METHODS
+                or not ev.fresh or ev.dt < rec.start_t - DOOR_CLOCK_SLACK_S):
+            return None
+        if rec.end_t is not None and time.time() > rec.end_t + HA_ECHO_GRACE_S:
+            return None
+        return rec
+
+    @callback
+    def _emit_ha_unlock(self, rec: _HaUnlock) -> None:
+        """Emit the HA unlock's single activity line under its reserved ctx
+        (idempotent). Used when the lock's response is the first evidence —
+        before the command returns, or a late confirmation of a command that
+        reported failure — so the state that parents to ``rec.ctx_id`` always
+        has its line."""
+        if rec.emitted:
+            return
+        rec.emitted = True
+        rec.ev = LockEvent(type="unlock", dt=time.time(), source="command",
+                           method="remote", user_id=rec.user_id)
+        self._emit_event("unlock", rec.ev, cause_ctx_id=rec.ctx_id,
+                         user_id=rec.user_id)
+
     def _unlock_near(self, dt: float):
         """The (ev, ctx_id, user_id) of the held or last-emitted unlock event for
         the physical unlock at device-time ``dt`` (within UNLOCK_COALESCE_S)."""
@@ -579,10 +643,21 @@ class EraController:
             _label, uid, _name = lookup(
                 self._options.get(CONF_CREDENTIALS, []), ev.method, ev.cred)
             ev_user = ev.user_id or uid
+            ha = self._ha_echo(ev)
             echo_of_emitted = (
                 ev.method == "remote" and self._last_unlock_discrete_dt is not None
                 and abs(ev.dt - self._last_unlock_discrete_dt) <= UNLOCK_COALESCE_S)
-            if hold is not None and hold.accepts(ev) and not echo_of_emitted:
+            if ha is not None:
+                # The lock's response to OUR unlock command (dp61 echo / dp62
+                # phone_remote, either order, before or after the command
+                # returned): not a second unlock. It links to the HA unlock's
+                # reserved ctx. A late confirmation of a command that reported
+                # failure is the HA unlock landing after all: log it now.
+                ha.echoed = True
+                if ha.end_t is not None:
+                    self._emit_ha_unlock(ha)
+                ctx_id = ha.ctx_id
+            elif hold is not None and hold.accepts(ev) and not echo_of_emitted:
                 # A (buffered) credential unlock that may explain a held
                 # door-open: collect it; the hold emits ONE unlock on resolution
                 # under its reserved context.
@@ -654,11 +729,20 @@ class EraController:
             near = self._unlock_near(ev.dt)
             if near is not None:
                 cause, cause_ctx_id = near[0], near[1]
+        ha = self._ha_unlock
+        if (new == UNLOCKED and ha is not None and cause_ctx_id is not None
+                and cause_ctx_id == ha.ctx_id):
+            # Our echo won the ordering (possibly while the command is still in
+            # flight): the state is the HA unlock's, by its user.
+            self._emit_ha_unlock(ha)
+            cause = ha.ev
         user_id: str | None = None
         refinable = False
         if ev.fresh:
             if new == UNLOCKED:
                 reason, display, user_id = self._attribute_unlock(cause)
+                if ha is not None and cause is ha.ev:
+                    display = ha.user_name
                 self._last_method = cause.method
                 self._last_user = display
                 refinable = cause_ctx_id is not None
@@ -895,19 +979,39 @@ class EraController:
     async def async_unlock(
         self, user_id: str | None, user_name: str | None,
     ) -> str | None:
-        await self.hass.async_add_executor_job(self._unlock)
+        # Mark the unlock in flight BEFORE publishing: the listener hears the
+        # lock's response (dp61 echo, dp62 phone_remote) on the same connection,
+        # often before the command returns, and it must be absorbed as our echo
+        # (see HA_ECHO_GRACE_S / _ha_echo) rather than logged as an app unlock.
+        rec = _HaUnlock(Context(user_id=user_id).id, user_id,
+                        user_name or "Home Assistant", time.time())
+        self._ha_unlock = rec
+        try:
+            await self.hass.async_add_executor_job(self._unlock)
+        except HomeAssistantError:
+            # Unconfirmed — but if the lock already reported an unlock for this
+            # command (e.g. dp62 seen, dp61 echo missed) it did unlock.
+            if not rec.echoed:
+                raise
+            _LOGGER.debug("HA unlock unconfirmed but the lock reported it; "
+                          "treating as unlocked")
+        finally:
+            rec.end_t = time.time()
         self._last_method = "remote"
-        self._last_user = user_name or "Home Assistant"
+        self._last_user = rec.user_name
         self._last_applied_dt = time.time()
-        ev = LockEvent(type="unlock", dt=time.time(), source="command",
-                       method="remote", user_id=user_id)
-        # This HA command emits its own discrete unlock below; its time is
-        # recorded (in _emit_event) so an inbound dp61 echo for the same command
-        # (device frame_t ~= now) is coalesced away rather than double-counted
-        # (device-time is wall-clock).
-        ctx_id = self._transition(
-            UNLOCKED, "Unlocked in Home Assistant", user_id=user_id,
-            cause_event=ev, discrete="unlock")
+        if rec.emitted:
+            # Its line was already emitted (an echo applied the state first).
+            self._transition(UNLOCKED, "Unlocked in Home Assistant",
+                             user_id=user_id, cause_ctx_id=rec.ctx_id)
+            ctx_id = rec.ctx_id
+        else:
+            rec.emitted = True
+            rec.ev = LockEvent(type="unlock", dt=time.time(), source="command",
+                               method="remote", user_id=user_id)
+            ctx_id = self._transition(
+                UNLOCKED, "Unlocked in Home Assistant", user_id=user_id,
+                cause_event=rec.ev, discrete="unlock", cause_ctx_id=rec.ctx_id)
         self._start_relock()
         # Poll for the lock's own auto-lock (dp11) before the failsafe timer; we
         # know we unlocked, so arm the polls here rather than waiting on an
