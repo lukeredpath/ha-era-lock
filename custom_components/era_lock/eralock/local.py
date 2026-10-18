@@ -1,7 +1,7 @@
 """Local LAN control/read for the ERA lock over the Tuya Wi-Fi hub.
 
 The lock is a BLE sub-device of the hub, addressed by its `cid`, so traffic goes:
-  caller -> hub (192.168.0.59:6668, Tuya v3.4) -> BLE -> lock.
+  caller -> hub (<hub_ip>:6668, Tuya v3.4) -> BLE -> lock.
 
 Reads work fully (battery, unlock events, enrolled-method attribution). Writing
 the unlock DP is accepted by the gateway but does NOT actuate (cloud-ticket-

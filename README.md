@@ -20,13 +20,21 @@ Wi-Fi hub and fronted by ERA's cloud. Installable via [HACS](https://hacs.xyz/).
 
 ## What it exposes
 
-- **`lock`** — remote unlock via Tuya cloud MQTT. The hardware exposes no
-  authoritative lock-state DP and auto-relocks, so state is inferred by a
+- **`lock`** — remote unlock via Tuya cloud MQTT. There is **no remote lock**:
+  the lock relocks itself (auto-lock / handle-lift), so `lock.lock` fails with
+  an error rather than pretending — automations and voice assistants are never
+  told the door locked when it didn't (see **Mark as locked** below). The
+  hardware exposes no authoritative lock-state DP, so state is inferred by a
   device-time-ordered engine that is robust to the BLE lock's buffered,
   replayed-on-wake event stream:
   - captures the device's *own* lock signal (`dp11`) by polling for it in the
     seconds after an unlock → **"Device locked"** (covers both the ~30s auto-lock
-    and a manual handle-lift), with a 60s failsafe timer as a backstop;
+    and a manual handle-lift). If the polls miss it, a failsafe (≥60s) decides
+    what can honestly be concluded: with a door-contact sensor and the door
+    kept shut, the lock will have auto-locked → **"Auto-locked (assumed)"**;
+    if the door was opened (an entry/exit — the lock then waits for a
+    handle-lift) it stays **unlocked** until the lock reports; with no door
+    sensor the state becomes **unknown** (**"Lock state not confirmed"**);
   - shows a transient **"Unlocking…"** state during the cloud round-trip;
   - with an optional **door-contact sensor**, open-while-locked ⇒ unlocked at
     once (the door can't open while deadbolt-locked); it then waits ~10s for the
@@ -35,14 +43,21 @@ Wi-Fi hub and fronted by ERA's cloud. Installable via [HACS](https://hacs.xyz/).
     re-sync ~1 min after an exit to catch a lock-up done just after the door shut;
   - writes **one rich activity-log line per thing that happened** — *Unlocked by
     Luke (fingerprint)*, *Unlocked (fingerprint #2)*, *Unlocked in Home
-    Assistant*, *Auto-locked (timer)*, *Failed fingerprint attempt*, ... — even
+    Assistant*, *Auto-locked (assumed)*, *Failed fingerprint attempt*, ... — even
     when a buffered flush nets the state change away; the lock's own state rows
     are linked to (shown as caused by) that line, and it records whether each
     state was **device-confirmed or inferred**.
 - **`event`** — **Activity**: a discrete event per unlock/lock/failed
-  unlock/tamper/door (`event_type` + `method`/`credential_id`/`user`/`label`/
-  `description` attributes) for automations.
+  unlock/tamper/door/connectivity/state-unconfirmed (`event_type` +
+  `method`/`credential_id`/`user`/`label`/`description` attributes) for
+  automations.
 - **`sensor`** — battery %.
+- **`binary_sensor`** — **Connection**: whether the hub reports the lock
+  reachable.
+- **`button`** — **Mark as locked**: tell Home Assistant the door is locked
+  (e.g. after a lock-up it didn't report). It actuates nothing; the state is
+  shown as locked (inferred), credited to you ("Marked as locked in Home
+  Assistant"), until the lock itself reports otherwise.
 - **`button`** — **Sync**: force the BLE lock to wake and report, flushing any
   buffered events (use sparingly — waking the lock costs battery).
 
@@ -76,7 +91,8 @@ key material** — that is deliberate.
 ## Development
 
 See [`dev/README.md`](dev/README.md) for a local Home Assistant Core dev
-environment.
+environment, and [`tests/README.md`](tests/README.md) for the offline test
+suite (`python3 -I -B tests/offline/run_all.py`, no HA install needed).
 
 ## Safety & ethics
 

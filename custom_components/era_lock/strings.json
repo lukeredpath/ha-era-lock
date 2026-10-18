@@ -11,7 +11,8 @@
               "failed_unlock": "Failed unlock",
               "tamper": "Tamper",
               "door": "Door",
-              "connectivity": "Connectivity"
+              "connectivity": "Connectivity",
+              "state_unconfirmed": "State not confirmed"
             }
           }
         }
@@ -20,6 +21,11 @@
     "binary_sensor": {
       "connected": {
         "name": "Connection"
+      }
+    },
+    "button": {
+      "mark_locked": {
+        "name": "Mark as locked"
       }
     }
   },
@@ -62,7 +68,8 @@
       "invalid_auth": "Incorrect ERA email/password, or an invalid signing key.",
       "mqtt_failed": "Connected to ERA, but the Tuya cloud rejected the connection — check the hub keys (local key / cid / hub id).",
       "bad_local_key": "Could not read the lock over the LAN — check the Hub local key and Hub IP.",
-      "unknown": "Unexpected error — see the logs."
+      "unknown": "Unexpected error — see the logs.",
+      "cannot_connect": "Could not reach the ERA service — check your internet connection and try again."
     },
     "abort": {
       "already_configured": "This lock is already configured.",
@@ -80,7 +87,7 @@
       },
       "settings": {
         "title": "Lock settings",
-        "description": "After an unlock the lock is polled for its real auto-lock; if that isn't captured, “locked” is assumed after the failsafe window below (min 60s). An optional door-contact sensor refines the state (door open ⇒ unlocked).",
+        "description": "After an unlock the lock is polled for its real auto-lock. If that isn't captured within the failsafe window below (min 60s): with a door-contact sensor, “locked” is assumed only if the door stayed shut (after the door has been opened the lock waits for a handle-lift, so it stays unlocked until the lock reports); without one, the state becomes unknown. The optional door-contact sensor also refines the state (door open ⇒ unlocked).",
         "data": {
           "auto_relock_seconds": "Relock failsafe (seconds, min 60)",
           "door_contact_entity_id": "Door contact sensor (optional)",
@@ -108,6 +115,11 @@
     },
     "error": {
       "invalid_id": "The credential id must be a whole number."
+    }
+  },
+  "exceptions": {
+    "lock_not_supported": {
+      "message": "The ERA lock relocks itself and can't be locked remotely. If you've locked it by hand and it wasn't reported, press “Mark as locked”."
     }
   }
 }

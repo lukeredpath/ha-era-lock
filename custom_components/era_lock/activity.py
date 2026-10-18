@@ -1,7 +1,7 @@
 """Human-readable activity text for the ERA Protect Lock (HA-free, pure).
 
 One rich line per thing that happened — "Unlocked by Luke (fingerprint)",
-"Auto-locked (timer)", "Failed fingerprint attempt" — used for:
+"Auto-locked (assumed)", "Failed fingerprint attempt" — used for:
 
   - the ``EVENT_ACTIVITY`` logbook row (described in logbook.py), which is the
     activity log's single rich line for each discrete event;
@@ -78,10 +78,17 @@ def unlock_message(
 
 def lock_message(source: str | None) -> str:
     if source == "timer":
-        return "Auto-locked (timer)"
-    if source == "command":
-        return "Locked in Home Assistant"
+        # The relock failsafe: the lock auto-locks after any unlock unless the
+        # door was opened, and the door stayed shut, but its report was missed.
+        return "Auto-locked (assumed)"
+    if source == "manual":
+        return "Marked as locked in Home Assistant"
     return "Device locked"
+
+
+# The relock failsafe expired with no device lock and no usable door contact
+# to tell whether the lock could have auto-locked (see controller._relock_fired).
+STATE_UNCONFIRMED = "Lock state not confirmed"
 
 
 # Lock link state (see controller._set_online). While the hub reports the lock
@@ -119,6 +126,8 @@ def describe(
         return "Door"
     if etype == "connectivity":
         return LOCK_OFFLINE if subtype == "offline" else LOCK_ONLINE
+    if etype == "state_unconfirmed":
+        return STATE_UNCONFIRMED
     return etype.replace("_", " ").capitalize()
 
 
@@ -137,4 +146,6 @@ def icon(etype: str | None, method: str | None = None,
         return "mdi:door-open" if subtype == "open" else "mdi:door-closed"
     if etype == "connectivity":
         return "mdi:lan-disconnect" if subtype == "offline" else "mdi:lan-connect"
+    if etype == "state_unconfirmed":
+        return "mdi:lock-question"
     return None

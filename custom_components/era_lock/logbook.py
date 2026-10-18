@@ -2,7 +2,7 @@
 
 ``EVENT_ACTIVITY`` is fired once per discrete activity (by the event entity,
 after its de-dupe) and is the activity log's single rich line for it:
-"Unlocked by Luke (fingerprint)", "Auto-locked (timer)", "Failed fingerprint
+"Unlocked by Luke (fingerprint)", "Auto-locked (assumed)", "Failed fingerprint
 attempt", ... Its ``entity_id`` is the lock entity, so the frontend renders it as
 ``<lock name>: <message>`` in the global, device and lock-entity activity views;
 its context carries the activity's HA user (shown "By <user>") and is the parent

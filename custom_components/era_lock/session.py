@@ -1,7 +1,7 @@
 """Credential/session lifecycle for the integration.
 
 Wraps the eralock library's auth primitives into a small manager that the
-component drives. Everything here is SYNCHRONOUS (boto3 + requests under the
+component drives. Everything here is SYNCHRONOUS (plain HTTPS via requests under the
 hood); the component calls these methods via ``hass.async_add_executor_job`` and
 persists any changed credentials back to the config entry.
 

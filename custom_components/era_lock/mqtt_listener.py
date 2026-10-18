@@ -9,6 +9,13 @@ Runs a paho client in its own thread (paho-managed); callbacks bridge back to
 the HA loop with ``call_soon_threadsafe``. On an auth failure (expired session
 creds) it re-mints the Tuya session and reconnects.
 
+Resilience: paho re-raises callback exceptions out of ``loop_forever`` by
+default, which kills its network thread for good — silently. Every paho
+callback here therefore catches + logs (``_LOGGER.exception``) and carries on,
+malformed frames are tolerated, and an HA-side watchdog (every
+WATCHDOG_INTERVAL_S) restarts the listener if its paho thread has died anyway —
+replacing the dead client, never running two at once (see :meth:`restart`).
+
 It is the integration's ONLY Tuya MQTT connection. The broker allows one
 connection per clientId (and ours is a fixed config constant), so anything that
 publishes — the wake/synch (:meth:`EraMqttListener.wake`) and the HA remote
@@ -25,10 +32,13 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Callable
+from datetime import timedelta
 
 import paho.mqtt.client as mqtt
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.event import async_track_time_interval
 
 from .eralock import dpmap
 from .eralock.mqtt import UNLOCK_ECHO, CloudMqttLock, MqttUnlockError, UnlockTracker
@@ -46,6 +56,15 @@ CONNECT_WAIT_S = 10.0
 # A session refresh within this window is reused rather than re-minted (the
 # unlock retry and the paho thread's auth-failure path can both ask for one).
 REFRESH_REUSE_S = 30.0
+# How often the HA-side watchdog checks that paho's network thread is alive.
+WATCHDOG_INTERVAL_S = 60
+
+
+def _num(v) -> float | int | None:
+    """A frame timestamp, if it is one (bool is not)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return v
 
 
 def _alarm_value(raw):
@@ -113,12 +132,23 @@ class EraMqttListener:
         self._trackers_lock = threading.Lock()
         self._session_lock = threading.Lock()  # serialises session re-mints
         self._refreshed_at: float | None = None  # monotonic time of last re-mint
+        # Serialises start / stop / restart: never two live clients at once
+        # (the broker allows one connection per clientId).
+        self._lifecycle_lock = threading.Lock()
+        self._restarting = False  # a watchdog restart is queued/running
 
     def set_wake_manager(self, wake_manager) -> None:
         self._wake_manager = wake_manager
 
-    # -- lifecycle (start/stop run in an executor thread) --------------------
+    # -- lifecycle (start/stop/restart run in an executor thread) ------------
     def start(self) -> None:
+        with self._lifecycle_lock:
+            self._closing = False
+            self._start_client()
+
+    def _start_client(self) -> None:
+        """Create, configure and start a paho client (caller holds
+        ``_lifecycle_lock``)."""
         mq = self.mgr.mqtt_secrets()
         host, port = mq["broker"].replace("ssl://", "").split(":")
         client = mqtt.Client(
@@ -128,6 +158,9 @@ class EraMqttListener:
         client.username_pw_set(mq["username"], mq["password"])
         client.tls_set()
         client.reconnect_delay_set(min_delay=2, max_delay=120)
+        # Belt and braces: our callbacks already catch everything, but never
+        # let paho's network thread die on a callback exception.
+        client.suppress_exceptions = True
         client.on_connect = self._on_connect
         client.on_message = self._on_message
         client.on_disconnect = self._on_disconnect
@@ -137,11 +170,74 @@ class EraMqttListener:
         _LOGGER.debug("ERA MQTT listener started")
 
     def stop(self) -> None:
-        self._closing = True
-        self._connected.clear()
-        if self._client is not None:
-            self._client.loop_stop()
-            self._client.disconnect()
+        with self._lifecycle_lock:
+            self._closing = True
+            self._connected.clear()
+            if self._client is not None:
+                self._client.loop_stop()
+                self._client.disconnect()
+
+    # -- watchdog -----------------------------------------------------------------
+    @staticmethod
+    def _thread_alive(client) -> bool:
+        """paho's ``loop_start`` network thread is running (paho clears
+        ``_thread`` when ``loop_forever`` exits, e.g. on an escaped exception)."""
+        thread = getattr(client, "_thread", None)
+        return thread is not None and thread.is_alive()
+
+    @property
+    def alive(self) -> bool:
+        return self._client is not None and self._thread_alive(self._client)
+
+    @callback
+    def async_start_watchdog(self) -> Callable[[], None]:
+        """Check the paho thread every WATCHDOG_INTERVAL_S; returns the unsub."""
+        return async_track_time_interval(
+            self.hass, self._async_watchdog, timedelta(seconds=WATCHDOG_INTERVAL_S))
+
+    @callback
+    def _async_watchdog(self, _now=None) -> None:
+        if self._closing or self._restarting or self._client is None or self.alive:
+            return
+        _LOGGER.warning("ERA MQTT listener thread has stopped; restarting it")
+        self._restarting = True
+        self.hass.async_add_executor_job(self._restart_job)
+
+    def _restart_job(self) -> None:
+        try:
+            self.restart()
+        except Exception:  # noqa: BLE001 — next watchdog tick retries
+            _LOGGER.exception("ERA MQTT listener restart failed; will retry")
+        finally:
+            self._restarting = False
+
+    def restart(self) -> None:
+        """Replace a client whose network thread died (blocking: executor).
+
+        The dead client is torn down first — callbacks detached, loop stopped,
+        socket closed — so there is never a second live connection with our
+        clientId; then a fresh client is started exactly as at setup. A no-op
+        when closing, or if the thread turns out to be alive after all."""
+        with self._lifecycle_lock:
+            if self._closing:
+                return
+            old = self._client
+            if old is not None and self._thread_alive(old):
+                return
+            self._connected.clear()
+            if old is not None:
+                old.on_connect = old.on_message = old.on_disconnect = None
+                for name in ("loop_stop", "disconnect", "_sock_close"):
+                    fn = getattr(old, name, None)
+                    if fn is None:
+                        continue
+                    try:
+                        fn()
+                    except Exception:  # noqa: BLE001 — it is already dead
+                        _LOGGER.debug("ERA MQTT: dead client %s failed", name,
+                                      exc_info=True)
+            self._start_client()
+            _LOGGER.info("ERA MQTT listener restarted")
 
     def wake(self) -> None:
         """Publish the synch DP (dp54) so the lock reconnects and reports its
@@ -244,7 +340,15 @@ class EraMqttListener:
             self._apply_creds()
 
     # -- paho callbacks (paho thread) ----------------------------------------
+    # Each body is wrapped: an exception escaping a paho callback would end
+    # loop_forever and kill the network thread (see module docstring).
     def _on_connect(self, client, userdata, flags, reason_code, properties) -> None:
+        try:
+            self._handle_connect(client, reason_code)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("ERA MQTT: error in on_connect")
+
+    def _handle_connect(self, client, reason_code) -> None:
         rc = int(reason_code.value) if hasattr(reason_code, "value") else int(reason_code)
         if rc == 0:
             for topic in self._helper.in_topics:
@@ -257,11 +361,21 @@ class EraMqttListener:
             self._refresh_and_reconnect()
 
     def _on_disconnect(self, client, userdata, *args) -> None:
-        self._connected.clear()
-        if not self._closing:
-            _LOGGER.debug("ERA MQTT disconnected; paho will retry")
+        try:
+            self._connected.clear()
+            if not self._closing:
+                _LOGGER.debug("ERA MQTT disconnected; paho will retry")
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("ERA MQTT: error in on_disconnect")
 
     def _on_message(self, client, userdata, msg) -> None:
+        try:
+            self._handle_message(msg)
+        except Exception:  # noqa: BLE001 — one bad frame must not kill the thread
+            _LOGGER.exception("ERA MQTT: error handling an inbound frame on %s",
+                              getattr(msg, "topic", "?"))
+
+    def _handle_message(self, msg) -> None:
         if self._wake_manager is not None:
             self._wake_manager.note_inbound()
         payload = self._helper._decrypt(msg.payload)
@@ -270,7 +384,10 @@ class EraMqttListener:
         _LOGGER.debug("ERA MQTT inbound %s: %s", msg.topic, payload)
         try:
             obj = json.loads(payload)
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return
+        if not isinstance(obj, dict):
+            _LOGGER.debug("ERA MQTT: ignoring non-object frame")
             return
         self._feed_trackers(obj)
         self._handle(obj)
@@ -301,8 +418,13 @@ class EraMqttListener:
         if data.get("cid") != self._helper.cid or not isinstance(dps, dict):
             return
 
-        frame_t = obj.get("t", 0)
-        tmap = data.get("t") if isinstance(data.get("t"), dict) else {}
+        # Timestamps are validated: a non-numeric one falls back (the frame
+        # time to HA's clock; a DP time to the frame time) rather than raising.
+        frame_t = _num(obj.get("t"))
+        if frame_t is None:
+            frame_t = time.time()
+        raw_tmap = data.get("t") if isinstance(data.get("t"), dict) else {}
+        tmap = {k: v for k, v in raw_tmap.items() if _num(v) is not None}
 
         # dp11 = electronic lock state (true=locked incl. auto-relock + manual
         # handle-lift, false=unlocked). The lock buffers changes and replays them

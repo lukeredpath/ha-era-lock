@@ -88,8 +88,10 @@ DOOR_HOLD_S = 10.0
 # failsafe: beyond that the lock would have auto-relocked (and an intervening
 # device lock disqualifies the credential anyway — see _pick_door_cause).
 DOOR_LOOKBACK_S = 60.0
-# Device clock vs HA wall-clock skew allowance (a credential "after" the open by
-# less than this still counts as before it).
+# Device clock vs HA wall-clock skew allowance (device-times are also floored to
+# whole seconds). A credential "after" the open by less than this still counts
+# as before it; a device report "before" an HA-side inference by less than this
+# still counts as after it (see _accepts_for_state).
 DOOR_CLOCK_SLACK_S = 5.0
 # Unlock methods that can explain a door opening from locked. "remote" is the
 # bare dp61 echo — a lone echo is still a real remote unlock.
@@ -194,9 +196,26 @@ class EraController:
         self._inferred: bool = True  # True until the lock itself confirms a state
         self._last_method: str | None = None
         self._last_user: str | None = None
-        self._last_applied_dt: float = 0.0  # device-time of the last applied state
+        # Device-report ordering (see _accepts_for_state). Two separate clocks:
+        #   - the DEVICE watermark orders device reports among themselves (their
+        #     device-times, floored seconds; ties broken by arrival order within
+        #     a burst);
+        #   - the INFERENCE cut-off is the HA wall-clock time of the last
+        #     state-setting HA-side inference (door open, door close from
+        #     unknown, HA unlock, mark-as-locked). A device report only loses to
+        #     an inference when it predates it by more than DOOR_CLOCK_SLACK_S.
+        # They used to be one value, so an HA inference stamped with HA's clock
+        # could swallow a genuine device report whose (floored/lagging) device
+        # time was a second "older" — e.g. a handle-lift right after a close.
+        self._last_device_dt: float = 0.0
+        self._last_device_ev: LockEvent | None = None  # last ACCEPTED device report
+        self._infer_t: float = 0.0
         self._pending: LockEvent | None = None
         self._pending_ctx_id: str | None = None  # ctx of the pending event's activity row
+        # The pending event is a FRESH device lock whose "Device locked" line and
+        # lock side effects are deferred until _apply settles on it (so a dp11
+        # false->true->false bounce inside the debounce logs nothing).
+        self._pending_defer: bool = False
         self._device_debounce = None
         # -- unlock-event coalescing (dp61 echo + method DP -> one event) -----
         self._unlock_echo = None            # buffered (ev, ctx_id, user_id) echo
@@ -220,6 +239,10 @@ class EraController:
         # startup: the hub only reports presence on change.
         self._online: bool = True
         self._relock_cancel = None
+        # Time of the unlock the armed failsafe is for, and the wall-clock time
+        # the door last opened (see _relock_fired).
+        self._relock_since: float | None = None
+        self._door_opened_t: float | None = None
         self._logged_state: str | None = "__init__"  # state-change de-dupe
         # -- subscriptions ----------------------------------------------------
         self._unsub_raw = None
@@ -502,9 +525,12 @@ class EraController:
 
     # -- auto-relock timer ----------------------------------------------------
     @callback
-    def _start_relock(self) -> None:
+    def _start_relock(self, since: float) -> None:
+        """(Re)arm the failsafe for an unlock at ``since`` (device-time for a
+        reported unlock, wall-clock for an HA command)."""
         self._cancel_relock()
         if self._relock_seconds > 0:
+            self._relock_since = since
             self._relock_cancel = async_call_later(
                 self.hass, self._relock_seconds, self._relock_fired)
 
@@ -522,15 +548,57 @@ class EraController:
 
     @callback
     def _relock_fired(self, _now) -> None:
+        """The post-unlock polls saw no device lock (dp11:true) in the failsafe
+        window. Any device lock since the unlock cancels this timer, so reaching
+        here means the lock's word is missing. What we may conclude depends on
+        the door (the lock auto-locks ~30s after ANY unlock UNLESS the door was
+        opened — after an entry/exit it stays unlocked until a handle-lift):
+
+          - door contact usable, door NOT opened since the unlock: it will have
+            auto-locked and we merely missed the report -> LOCKED, inferred,
+            "Auto-locked (assumed)";
+          - door contact usable, door opened since the unlock (or open now): it
+            cannot have auto-locked -> no-op, stays UNLOCKED until a real device
+            lock report;
+          - no usable door contact (none configured, or it isn't reporting
+            open/closed right now, so an opening may have been missed): we
+            can't tell -> UNKNOWN, inferred, "Lock state not confirmed". Never
+            LOCKED without evidence.
+        """
         self._relock_cancel = None
-        if self._door_open():
-            return  # door-open suppresses the timed relock
-        if self._state == LOCKED:
-            return  # already locked: nothing to assume (and no activity line)
-        self._last_applied_dt = time.time()
-        ev = LockEvent(type="state_report", dt=time.time(), source="timer", locked=True)
-        self._transition(LOCKED, activity.lock_message("timer"), inferred=True,
-                         cause_event=ev, discrete="lock")
+        since = self._relock_since
+        self._relock_since = None
+        if self._state in (LOCKED, None):
+            return  # already locked / already unknown: nothing to add
+        if self._door_sensor_ok():
+            if self._door_open() or self._door_opened_since(since):
+                _LOGGER.debug("relock failsafe: door opened since the unlock; "
+                              "staying unlocked until the lock reports")
+                return
+            ev = LockEvent(type="state_report", dt=time.time(), source="timer",
+                           locked=True)
+            self._transition(LOCKED, activity.lock_message("timer"), inferred=True,
+                             cause_event=ev, discrete="lock")
+            return
+        ev = LockEvent(type="state_unconfirmed", dt=time.time(), source="timer")
+        self._transition(None, activity.STATE_UNCONFIRMED, inferred=True,
+                         cause_event=ev, discrete="state_unconfirmed")
+
+    def _door_opened_since(self, since: float | None) -> bool:
+        """Has the door opened since the unlock at ``since``? Generous by the
+        clock slack (device-time vs HA wall-clock): erring towards "opened"
+        only ever costs an assumed lock, never invents one."""
+        t = self._door_opened_t
+        if t is None:
+            return False
+        return since is None or t >= since - DOOR_CLOCK_SLACK_S
+
+    def _door_sensor_ok(self) -> bool:
+        """A door contact is configured AND currently reporting open/closed."""
+        if not self._door_entity:
+            return False
+        st = self.hass.states.get(self._door_entity)
+        return st is not None and st.state in ("on", "off")
 
     def _door_open(self) -> bool:
         if not self._door_entity:
@@ -612,6 +680,7 @@ class EraController:
             self._cancel_device_debounce()
             self._pending = None
             self._pending_ctx_id = None
+            self._pending_defer = False
             self._attributable_ctx_id = None
             self._state = None
             self._logged_state = None
@@ -637,6 +706,8 @@ class EraController:
         # Remember its context so, if this event wins the debounce, the
         # resulting state change is attributed to it. The event entity de-dupes
         # re-flushes by device-time.
+        accepted = self._accepts_for_state(ev)
+        defer_lock = False
         ctx_id: str | None = None
         hold = self._door_hold
         if ev.type == "unlock":
@@ -682,33 +753,82 @@ class EraController:
                     self._emit_held_unlocks(
                         hold, [c for c in hold.candidates if c[0].dt < ev.dt])
             ctx_id = Context().id
-            self._emit_event("lock", ev, cause_ctx_id=ctx_id, user_id=None)
+            if ev.fresh and accepted:
+                # A LIVE lock that will become the pending state: its line and
+                # the lock side effects wait for _apply to settle on it, so a
+                # transient false->true->false bounce inside the debounce
+                # neither logs a lock nor cancels the post-unlock polls.
+                defer_lock = True
+            elif not (ev.fresh and self._pending_defer and self._pending is not None
+                      and self._pending.dt == ev.dt):
+                # History (buffered, or superseded by newer device/inference
+                # state): log it now, in arrival order, with no side effects.
+                # A same-second repeat of the deferred lock is dropped (the
+                # deferred line will represent it).
+                self._emit_event("lock", ev, cause_ctx_id=ctx_id, user_id=None)
 
-        # Immediate side-effects for FRESH (live) events only.
-        if ev.fresh:
-            if ev.type == "unlock":
-                self._start_relock()  # (re)start the failsafe window
-                if self.coordinator.wake is not None:
-                    self.coordinator.wake.on_unlock()  # poll for the real auto-lock
-            elif ev.type == "state_report" and ev.locked:
-                self._cancel_relock()
-                if self.coordinator.wake is not None:
-                    # real lock seen: stop polling for it, and a pending
-                    # post-close re-sync (looking for this lock-up) is moot.
-                    self.coordinator.wake.cancel_polls()
-                    self.coordinator.wake.cancel_followup()
+        # Immediate side-effects for FRESH (live) unlocks. (A fresh lock's side
+        # effects run in _apply once it settles — see _on_device_locked.)
+        if ev.fresh and ev.type == "unlock":
+            self._start_relock(ev.dt)  # (re)start the failsafe window
+            if self.coordinator.wake is not None:
+                self.coordinator.wake.on_unlock()  # poll for the real auto-lock
 
         # Ordered + debounced state application: the latest device-time wins, so a
         # buffered flush settles on the lock's real final state (no flicker, and
         # stale replays don't fire live side-effects or replay old causes).
-        if ev.dt <= self._last_applied_dt:
+        if not accepted:
             return
-        self._last_applied_dt = ev.dt
+        self._last_device_dt = ev.dt
+        self._last_device_ev = ev
         self._pending = ev
         self._pending_ctx_id = ctx_id
+        self._pending_defer = defer_lock
         if self._device_debounce is not None:
             self._device_debounce()
         self._device_debounce = async_call_later(self.hass, DEVICE_DEBOUNCE_S, self._apply)
+
+    def _accepts_for_state(self, ev: LockEvent) -> bool:
+        """May this device report (become the pending) state?
+
+        Device order: a report older (by device-time) than the last accepted
+        one is history. The lock's device-times are whole seconds, so a
+        same-second report is a tie, broken by ARRIVAL ORDER while a burst is
+        still being debounced (the later report wins — e.g. a dp11
+        false->true->false bounce all stamped in one second settles on false);
+        a same-second report that changes nothing, or arrives after the burst
+        settled (a re-flush), is not new state.
+
+        Inference cut-off: HA-side inferences (door, HA unlock, mark-as-locked)
+        are stamped with HA's wall-clock, which the device clock may trail by
+        a few seconds. A report predating the last inference by more than
+        DOOR_CLOCK_SLACK_S is pre-inference history; within the slack it is
+        accepted, except a LOCK while the door is open (a lock-up "just
+        before" the opening is the buffered relock it superseded — cf.
+        _lock_after_open)."""
+        if ev.dt < self._last_device_dt:
+            return False
+        last = self._last_device_ev
+        if ev.dt == self._last_device_dt and last is not None:
+            if self._device_debounce is None:
+                return False  # burst settled: a same-second re-flush
+            if bool(last.locked) == bool(ev.locked):
+                return False  # same state: keep the first (its ctx is reserved)
+        cut = self._infer_t
+        if ev.dt < cut - DOOR_CLOCK_SLACK_S:
+            return False
+        if ev.dt < cut and ev.locked and self._door_open():
+            return False
+        return True
+
+    @callback
+    def _on_device_locked(self) -> None:
+        """The device's own lock settled as the current state: the failsafe,
+        the post-unlock polls and a pending post-close re-sync are all moot."""
+        self._cancel_relock()
+        if self.coordinator.wake is not None:
+            self.coordinator.wake.cancel_polls()
+            self.coordinator.wake.cancel_followup()
 
     @callback
     def _apply(self, _now=None) -> None:
@@ -716,11 +836,23 @@ class EraController:
         ev = self._pending
         if ev is None:
             return
+        deferred = self._pending_defer
         self._pending = None
+        self._pending_defer = False
         cause_ctx_id = self._pending_ctx_id  # the discrete event emitted on arrival
         self._pending_ctx_id = None
         new = LOCKED if ev.locked else UNLOCKED
+        if new == LOCKED:
+            if deferred:
+                # The live lock survived the debounce: NOW it happened.
+                self._emit_event("lock", ev, cause_ctx_id=cause_ctx_id, user_id=None)
+            self._on_device_locked()
         if new == self._state:
+            if deferred and self._inferred:
+                # The lock confirms a state HA had only inferred (e.g. assumed
+                # or marked locked): same row, now device-confirmed.
+                self._transition(LOCKED, activity.lock_message(ev.source),
+                                 cause_ctx_id=cause_ctx_id)
             return  # no state change (the discrete event was already emitted)
         cause = ev
         if new == UNLOCKED and ev.type != "unlock":
@@ -747,15 +879,12 @@ class EraController:
                 self._last_user = display
                 refinable = cause_ctx_id is not None
             else:
-                self._cancel_relock()
                 reason = activity.lock_message(ev.source)
         else:
             # buffered history: sync to the lock's real final state, don't replay
-            if new == LOCKED:
-                self._cancel_relock()
             reason = f"Synced from lock: {'locked' if new == LOCKED else 'unlocked'}"
-        # The discrete event was already published in _on_push_state; link this
-        # state change to it (cause_ctx_id) rather than emitting again.
+        # The discrete event was already published (on arrival, or just above
+        # for a deferred lock); link this state change to it (cause_ctx_id).
         self._transition(new, reason, user_id=user_id, cause_ctx_id=cause_ctx_id)
         if refinable:
             self._attributable_ctx_id = cause_ctx_id
@@ -826,8 +955,12 @@ class EraController:
             # wake past the battery rate limit: the held attribution below
             # depends on the buffered flush it triggers.
             self.coordinator.wake.on_door_change(force=opened_from_locked)
-        self._last_applied_dt = time.time()
         if new.state == "on":  # opened -> can't be deadbolt-locked
+            # An opening is the strongest evidence there is: unlocked at this
+            # instant. Device reports from (well) before it are history (see
+            # _accepts_for_state), and an armed failsafe can no longer assume
+            # an auto-lock (the lock waits for a handle-lift after an opening).
+            self._door_opened_t = self._infer_t = time.time()
             self._cancel_relock()
             if opened_from_locked:
                 # Unlocked for certain, but HOW is ambiguous: a fingerprint/card
@@ -868,6 +1001,7 @@ class EraController:
             # door was "open" (stale state / mis-synced sensor) is the device's
             # word and wins over the inference.
             if self._state is None:
+                self._infer_t = time.time()
                 ev = LockEvent(type="door", dt=time.time(), source="door",
                                subtype="close")
                 self._transition(UNLOCKED, "Door closed", inferred=True,
@@ -961,19 +1095,22 @@ class EraController:
             else:
                 self._exit_pending = True  # door still open: arm on the close
 
-    # -- commands (called by the lock entity, which resolves the caller) ------
-    # Both commands return the context id of the activity line they emitted, so
-    # the lock entity parents its own command-completion state write to it.
-    async def async_lock(self, user_id: str | None) -> str | None:
-        # No hardware lock command (the lock auto-relocks), so this is a manual
-        # "mark as locked" to assert the secured state the silent mechanical
-        # thumbturn doesn't report.
+    # -- commands (called by the entities, which resolve the caller) ----------
+    # Both return the context id of the activity line they emitted, so the
+    # calling entity can parent its own completion state write to it.
+    @callback
+    def mark_locked(self, user_id: str | None) -> str | None:
+        """The "Mark as locked" button: a person asserts the door is locked
+        (e.g. after a silent mechanical lock-up the lock didn't report). There
+        is NO hardware lock command — the lock relocks itself — so this only
+        sets the state: LOCKED, inferred, attributed to ``user_id``. A later
+        device report still wins (it is newer than this assertion)."""
         self._cancel_relock()
-        self._last_applied_dt = time.time()
-        ev = LockEvent(type="state_report", dt=time.time(), source="command",
-                       locked=True)
+        self._infer_t = time.time()
+        ev = LockEvent(type="state_report", dt=time.time(), source="manual",
+                       locked=True, user_id=user_id)
         return self._transition(
-            LOCKED, activity.lock_message("command"), inferred=True,
+            LOCKED, activity.lock_message("manual"), inferred=True,
             user_id=user_id, cause_event=ev, discrete="lock")
 
     async def async_unlock(
@@ -986,12 +1123,19 @@ class EraController:
         rec = _HaUnlock(Context(user_id=user_id).id, user_id,
                         user_name or "Home Assistant", time.time())
         self._ha_unlock = rec
+        # The command is an inference cut-off: history the command's wake
+        # flushes (older than it) must not re-impose a pre-command state.
+        prev_infer_t, self._infer_t = self._infer_t, rec.start_t
         try:
             await self.hass.async_add_executor_job(self._unlock)
         except HomeAssistantError:
             # Unconfirmed — but if the lock already reported an unlock for this
             # command (e.g. dp62 seen, dp61 echo missed) it did unlock.
             if not rec.echoed:
+                # It didn't happen: undo the cut-off (unless a newer inference,
+                # e.g. a door opening, has moved it since).
+                if self._infer_t == rec.start_t:
+                    self._infer_t = prev_infer_t
                 raise
             _LOGGER.debug("HA unlock unconfirmed but the lock reported it; "
                           "treating as unlocked")
@@ -999,7 +1143,6 @@ class EraController:
             rec.end_t = time.time()
         self._last_method = "remote"
         self._last_user = rec.user_name
-        self._last_applied_dt = time.time()
         if rec.emitted:
             # Its line was already emitted (an echo applied the state first).
             self._transition(UNLOCKED, "Unlocked in Home Assistant",
@@ -1012,7 +1155,7 @@ class EraController:
             ctx_id = self._transition(
                 UNLOCKED, "Unlocked in Home Assistant", user_id=user_id,
                 cause_event=rec.ev, discrete="unlock", cause_ctx_id=rec.ctx_id)
-        self._start_relock()
+        self._start_relock(rec.start_t)
         # Poll for the lock's own auto-lock (dp11) before the failsafe timer; we
         # know we unlocked, so arm the polls here rather than waiting on an
         # inbound unlock event (an HA unlock only echoes a bare dp11:false).

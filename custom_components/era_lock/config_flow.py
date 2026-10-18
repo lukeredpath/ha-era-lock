@@ -20,6 +20,7 @@ import json
 import logging
 from typing import Any
 
+import requests
 import voluptuous as vol
 from homeassistant.config_entries import (
     ConfigEntry,
@@ -54,7 +55,7 @@ from .const import (
     DEFAULT_WAKE_HEARTBEAT,
     DOMAIN,
 )
-from .eralock.era import EraAuthError
+from .eralock.era import EraAuthError, EraConnectionError, EraError
 from .eralock.local import LocalLock
 from .eralock.mqtt import CloudMqttLock, MqttUnlockError
 from .eralock.secrets import DEFAULTS, SecretsError
@@ -132,6 +133,14 @@ async def _validate(hass: HomeAssistant, email: str, password: str,
     except EraAuthError as e:
         _LOGGER.debug("ERA auth failed: %s", e)
         raise _ValidationError("invalid_auth") from e
+    except (EraConnectionError, requests.RequestException) as e:
+        # Transport (DNS / timeout / 5xx / throttling / non-JSON): not the
+        # user's credentials — let them retry rather than re-enter them.
+        _LOGGER.debug("ERA service unreachable: %s", e)
+        raise _ValidationError("cannot_connect") from e
+    except EraError as e:
+        _LOGGER.warning("ERA service rejected the request: %s", e)
+        raise _ValidationError("unknown") from e
     except MqttUnlockError as e:
         _LOGGER.debug("Tuya MQTT connect failed: %s", e)
         raise _ValidationError("mqtt_failed") from e

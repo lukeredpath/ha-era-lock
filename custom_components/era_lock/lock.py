@@ -9,6 +9,8 @@ and delegates lock/unlock commands to the controller.
 lock's link (the hub reporting the lock offline makes it unavailable), not the
 local LAN poll (unlock rides cloud MQTT).
 
+``lock.lock`` raises: the lock can't be locked remotely (it relocks itself).
+
 Context linkage: every state row caused by an activity line parents to that
 line's context — rows from ``signal_state`` carry it, and a command's own
 completion write (the end of the "Unlocking…" spinner) re-asserts the context
@@ -22,11 +24,13 @@ from typing import Any
 
 from homeassistant.components.lock import LockEntity
 from homeassistant.core import Context, HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import EraConfigEntry
+from .const import DOMAIN
 from .controller import LOCKED, EraController
 from .coordinator import EraLockCoordinator
 from .entity import device_info
@@ -135,8 +139,12 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
         return uid, (user.name if user else None)
 
     async def async_lock(self, **kwargs: Any) -> None:
-        uid, _ = await self._caller()
-        await self._controller.async_lock(uid)
+        """There is no remote lock: the hardware relocks itself (auto-lock /
+        handle-lift). Fail loudly rather than pretend, so automations and voice
+        assistants never believe the door was locked. The "Mark as locked"
+        button (button.py) is the explicit, honest manual assertion."""
+        raise HomeAssistantError(
+            translation_domain=DOMAIN, translation_key="lock_not_supported")
 
     async def async_unlock(self, **kwargs: Any) -> None:
         # Show the transitioning ("Unlocking…") state immediately; the cloud

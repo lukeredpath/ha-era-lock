@@ -34,7 +34,8 @@ from .events import signal_event
 
 _LOGGER = logging.getLogger(__name__)
 
-EVENT_TYPES = ["unlock", "lock", "failed_unlock", "tamper", "door", "connectivity"]
+EVENT_TYPES = ["unlock", "lock", "failed_unlock", "tamper", "door", "connectivity",
+               "state_unconfirmed"]
 _DEDUPE_MAX = 128
 
 

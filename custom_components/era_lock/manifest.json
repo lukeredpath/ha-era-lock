@@ -1,7 +1,7 @@
 {
   "domain": "era_lock",
   "name": "ERA Protect Lock",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "config_flow": true,
   "after_dependencies": ["logbook"],
   "documentation": "https://github.com/lukeredpath/ha-era-lock",
@@ -12,7 +12,6 @@
   "requirements": [
     "tinytuya==1.20.0",
     "paho-mqtt==2.1.0",
-    "pycryptodome==3.24.1",
-    "boto3==1.43.113"
+    "pycryptodome==3.24.1"
   ]
 }
