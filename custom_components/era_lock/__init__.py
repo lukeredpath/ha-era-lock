@@ -6,7 +6,9 @@ secrets) is merged with the code DEFAULTS into one dict each consumer reads from
 
 Setup order (never half-set-up): controller (subscribed before anything can
 emit) -> cloud MQTT listener, waited on until CONNECTED (a stale stored session
-is re-minted on the way) -> platforms -> wake manager + one startup sync. An
+is re-minted on the way) -> platforms -> wake manager + one startup sync. The
+controller is seeded with the last known lock state (helpers.storage) before it
+starts, so the startup sync's replay corrects it through the normal paths. An
 ERA account rejection raises ConfigEntryAuthFailed (HA starts reauth); no
 connection within STARTUP_CONNECT_TIMEOUT_S raises ConfigEntryNotReady (HA
 retries). The first LAN poll runs in the background, so a dead hub can't stall
@@ -24,6 +26,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import Event, HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers.storage import Store
 
 from .const import (
     CONF_CREDENTIALS,
@@ -31,11 +34,12 @@ from .const import (
     CONF_SECRETS,
     CONF_SERVICE_CONFIG,
     CONF_SESSION,
+    DOMAIN,
     PLATFORMS,
     STARTUP_CONNECT_TIMEOUT_S,
     wake_heartbeat,
 )
-from .controller import EraController
+from .controller import STORAGE_VERSION, EraController
 from .coordinator import EraLockCoordinator, entry_credentials
 from .eralock.secrets import DEFAULTS
 from .eralock.session import Session
@@ -78,10 +82,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: EraConfigEntry) -> bool:
     coordinator.wake = wake
     listener.set_wake_manager(wake)
 
-    # Layer 2: the controller owns all decision logic. Start it (subscribe to
-    # signal_raw + the door entity) before the listener begins emitting.
+    # Layer 2: the controller owns all decision logic. Seed it with the state
+    # from before the restart, then start it (subscribe to signal_raw + the
+    # door entity) — both before the listener begins emitting, so the startup
+    # sync's buffered replay lands on top of the restored state in order.
     controller = EraController(hass, entry, coordinator)
     coordinator.controller = controller
+    await controller.async_restore()
     controller.start()
     entry.async_on_unload(controller.stop)
 
@@ -117,8 +124,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: EraConfigEntry) -> bool:
     entry.async_on_unload(listener.async_start_watchdog())
     wake.start()
     coordinator.started = True
-    # The state is unknown after a (re)start and the lock may be holding
-    # buffered events: one forced sync now that we're connected.
+    # The lock may be holding buffered events (and the state is only the
+    # restored, inferred one — or unknown): one forced sync now that we're
+    # connected.
     wake.startup_sync()
 
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
@@ -149,6 +157,10 @@ async def _async_shutdown(hass: HomeAssistant, coordinator: EraLockCoordinator) 
         coordinator.wake.stop()
     if coordinator.listener is not None:
         await hass.async_add_executor_job(coordinator.listener.stop)
+    # After the listener: nothing can change the state any more. Written now so
+    # a reload's new controller restores it (not a pending delayed save).
+    if coordinator.controller is not None:
+        await coordinator.controller.async_persist()
 
 
 def _reload_relevant(options: dict) -> dict:
@@ -180,3 +192,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: EraConfigEntry) -> bool
     """Unload a config entry."""
     await _async_shutdown(hass, entry.runtime_data)
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: EraConfigEntry) -> None:
+    """The entry was deleted: drop the lock state stored for restarts."""
+    await Store(hass, STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}").async_remove()

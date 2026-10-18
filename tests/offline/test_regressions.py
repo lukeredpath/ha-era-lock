@@ -360,7 +360,7 @@ def t_p2_echo_in_flight():
 
 def t_p6_restart_unknown():
     hass, ctl = make()
-    check("P6: after a restart the state is UNKNOWN until the first event",
+    check("P6: after a restart with nothing stored the state is UNKNOWN until the first event",
           ctl._state is None and not activity_rows(hass))
 
 

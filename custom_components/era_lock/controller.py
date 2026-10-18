@@ -38,6 +38,7 @@ from homeassistant.helpers.event import (
     async_call_later,
     async_track_state_change_event,
 )
+from homeassistant.helpers.storage import Store
 
 from . import activity
 from .attribution import actor as attr_actor
@@ -135,6 +136,20 @@ DOOR_CAUSE_METHODS = ("fingerprint", "card", "ble", "phone_remote", "voice", "re
 # produces it, so a voice unlock is always someone else.
 HA_ECHO_GRACE_S = 5.0
 HA_ECHO_METHODS = ("remote", "phone_remote")
+
+# Restart persistence (see async_restore). The startup sync only makes the lock
+# replay BUFFERED changes: if nothing happened while HA was down it re-reports
+# no dp11, so without this the state sat at unknown until the next real event.
+# The controller persists the last known REAL state (locked/unlocked while
+# available) plus its two ordering clocks, and seeds them back before anything
+# can emit. The restored state is inferred and the weakest evidence there is:
+# any accepted device report or HA inference replaces it through the usual
+# paths. Saves are coalesced; HA flushes a pending one on its final write.
+STORAGE_VERSION = 1
+STORE_SAVE_DELAY_S = 5.0
+# A stored device watermark this far ahead of HA's clock is not trusted (it
+# would make every later report "history" until the clock caught up).
+RESTORE_MAX_FUTURE_S = 3600.0
 
 
 class _HaUnlock:
@@ -273,6 +288,11 @@ class EraController:
         self._relock_since: float | None = None
         self._door_opened_t: float | None = None
         self._logged_state: str | None = "__init__"  # state-change de-dupe
+        # -- restart persistence (see async_restore) --------------------------
+        self._store: Store = Store(hass, STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}")
+        # True while the current state is the one restored at startup (cleared
+        # by the first transition / reconnect that replaces it).
+        self._restored: bool = False
         # -- subscriptions ----------------------------------------------------
         self._unsub_raw = None
         self._unsub_door = None
@@ -308,6 +328,7 @@ class EraController:
             "state": self._state,
             "changed_by": self._changed_by,
             "inferred": self._inferred,
+            "restored": self._restored,
             "online": self._online,
             "auth_error": self._auth_error,
             "last_method": self._last_method,
@@ -358,6 +379,94 @@ class EraController:
     def _door_entity(self) -> str | None:
         return self._options.get(CONF_DOOR_CONTACT_ENTITY_ID)
 
+    # -- restart persistence --------------------------------------------------
+    async def async_restore(self) -> None:
+        """Seed the last known state from before the restart. Called by setup
+        BEFORE ``start`` and the listener, so every device report — including
+        the buffered replay the startup sync flushes — lands on top of it
+        through the normal ordering, exactly as if HA had never stopped.
+
+        Only a real state (locked/unlocked while the lock was available) is
+        stored; anything else comes up unknown, as before. The restored state is
+        inferred ("Restored after restart") and replaced by the first accepted
+        device report or HA inference. With it come the two ordering clocks
+        (see _accepts_for_state): a replayed report the controller already
+        weighed before the restart is history again, not news — without them a
+        pre-restart dp11 re-flush could overwrite a newer state.
+
+        No activity line and no side effects (no failsafe, no polls): nothing
+        happened at the door. A restored LOCKED contradicted by the door contact
+        reading open becomes UNLOCKED (see _restored_door_open)."""
+        try:
+            data = await self._store.async_load()
+        except Exception:  # noqa: BLE001 — a bad file must not block setup
+            _LOGGER.warning("Could not load the stored lock state; starting unknown",
+                            exc_info=True)
+            return
+        if not isinstance(data, dict):
+            return
+        now = time.time()
+        for attr, key in (("_last_device_dt", "last_device_dt"),
+                          ("_infer_t", "infer_t")):
+            v = data.get(key)
+            if (isinstance(v, (int, float)) and not isinstance(v, bool)
+                    and 0 < v <= now + RESTORE_MAX_FUTURE_S):
+                setattr(self, attr, float(v))
+        state = data.get("state")
+        if state not in (LOCKED, UNLOCKED):
+            return
+        self._state = self._logged_state = state
+        self._changed_by = activity.RESTORED
+        self._inferred = True
+        self._restored = True
+        self._last_method = data.get("last_method")
+        self._last_user = data.get("last_user")
+        _LOGGER.debug("lock state restored: %s", state)
+        if state == LOCKED and self._door_open():
+            self._restored_door_open()
+
+    @callback
+    def _restored_door_open(self) -> None:
+        """The door reads open while the restored state is LOCKED: it can't be
+        open with the deadbolt thrown, so it is unlocked — the same conclusion
+        a live opening draws, minus the hold (whatever unlocked it happened
+        while HA was down; a buffered credential still gets its activity line
+        from the startup flush). As with a live opening, NOW is the inference
+        cut-off, so a replayed pre-restart lock can't re-impose LOCKED on an
+        open door. Seeded silently: a state reason, no activity line."""
+        self._infer_t = time.time()
+        self._state = self._logged_state = UNLOCKED
+        self._changed_by = activity.RESTORED_DOOR_OPEN
+        self._inferred = True
+        _LOGGER.debug("restored LOCKED contradicted by an open door -> unlocked")
+
+    def _stored(self) -> dict:
+        """What survives a restart (evaluated when the save is written)."""
+        state = self._state if self.available and self._state in (LOCKED, UNLOCKED) else None
+        return {
+            "state": state,
+            "last_method": self._last_method,
+            "last_user": self._last_user,
+            "last_device_dt": self._last_device_dt,
+            "infer_t": self._infer_t,
+        }
+
+    @callback
+    def _schedule_save(self) -> None:
+        self._store.async_delay_save(self._stored, STORE_SAVE_DELAY_S)
+
+    async def async_persist(self) -> None:
+        """Write the current state now (unload / HA stop): a reload's new
+        controller must restore THIS state, not wait on a delayed write."""
+        try:
+            await self._store.async_save(self._stored())
+        except Exception:  # noqa: BLE001 — shutdown must carry on
+            _LOGGER.warning("Could not save the lock state", exc_info=True)
+
+    async def async_remove_store(self) -> None:
+        """The config entry was deleted: drop its stored state."""
+        await self._store.async_remove()
+
     # -- lifecycle ------------------------------------------------------------
     @callback
     def start(self) -> None:
@@ -407,6 +516,7 @@ class EraController:
         assertion). Returns the context id the publish parented to, if any."""
         self._changed_by = reason
         self._inferred = inferred
+        self._restored = False
         _LOGGER.debug("lock -> %s  (%s)%s", state or "unknown", reason,
                       " [inferred]" if inferred else "")
         emitted = False
@@ -441,6 +551,7 @@ class EraController:
             "user_id": user_id,
             "available": self.available,
         })
+        self._schedule_save()
 
     @callback
     def _refine_unlock(self, ctx_id: str | None, ev: LockEvent) -> None:
@@ -777,6 +888,7 @@ class EraController:
             self._attributable_ctx_id = None
             self._state = None
             self._logged_state = None
+            self._restored = False
             self._changed_by = activity.ONLINE_UNKNOWN
             self._inferred = True
             if self.coordinator.wake is not None:
@@ -876,6 +988,7 @@ class EraController:
             return
         self._last_device_dt = ev.dt
         self._last_device_ev = ev
+        self._schedule_save()  # the watermark survives a restart too
         self._pending = ev
         self._pending_ctx_id = ctx_id
         self._pending_defer = defer_lock
@@ -955,7 +1068,13 @@ class EraController:
                 # or marked locked): same row, now device-confirmed.
                 self._transition(LOCKED, activity.lock_message(ev.source),
                                  cause_ctx_id=cause_ctx_id)
-            return  # no state change (the discrete event was already emitted)
+                return
+            if not self._restored:
+                return  # no state change (the discrete event was already emitted)
+            # The lock confirms the state restored at startup (e.g. the startup
+            # flush replays the pre-restart dp11): fall through so the reason
+            # becomes the device's ("Synced from lock: locked", an unlock's
+            # attribution) and it is no longer inferred. Same state: no new row.
         cause = ev
         if new == UNLOCKED and ev.type != "unlock":
             # A bare dp11:false won the ordering, but the unlock it reports has
@@ -1050,6 +1169,12 @@ class EraController:
         # write at startup (or recovery from unavailable/unknown) isn't the door
         # moving — treating it as a close set HA to "unlocked" on every boot.
         if old is None or old.state not in ("on", "off"):
+            # ...but it IS the door's current position: a restored LOCKED that
+            # the sensor (not yet loaded when we restored) now reports open is
+            # the same contradiction async_restore resolves.
+            if new.state == "on" and self._restored and self._state == LOCKED:
+                self._restored_door_open()
+                self._publish_state(Context().id, None)
             return
         hold = self._door_hold
         opened_from_locked = (new.state == "on" and self._state == LOCKED

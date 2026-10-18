@@ -99,6 +99,14 @@ LOCK_ONLINE = "Lock back online"
 # Reconnect: the state is unknown until the next real event resolves it.
 ONLINE_UNKNOWN = "Lock back online (state unknown)"
 
+# Startup: the last known state, restored from before the restart (see
+# controller.async_restore). Only a state-row reason, never an activity line —
+# nothing happened at the door.
+RESTORED = "Restored after restart"
+# A restored "locked" contradicted by the door contact reading open: the door
+# can't be open with the deadbolt thrown, so it is unlocked.
+RESTORED_DOOR_OPEN = "Door open after restart"
+
 
 def describe(
     etype: str, *, method: str | None = None, cred=None,

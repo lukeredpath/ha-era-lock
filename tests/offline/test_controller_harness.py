@@ -179,6 +179,42 @@ mod("homeassistant.helpers.dispatcher",
 mod("homeassistant.helpers.event", async_call_later=async_call_later,
     async_track_state_change_event=async_track_state_change_event,
     async_track_time_interval=lambda hass, cb, interval: (lambda: None))
+# helpers.storage: an in-memory "disk" (STORE_DISK, key -> data) that survives
+# across controllers, so a test can simulate a restart. A delayed save records
+# its data_func; flush_store() writes the pending ones (HA's final write).
+STORE_DISK: dict = {}
+STORE_PENDING: dict = {}
+
+
+class Store:
+    def __init__(self, hass, version, key, **kw):
+        self.version, self.key = version, key
+
+    async def async_load(self):
+        data = STORE_DISK.get(self.key)
+        if isinstance(data, Exception):
+            raise data
+        return None if data is None else dict(data)
+
+    def async_delay_save(self, data_func, delay=0):
+        STORE_PENDING[self.key] = data_func
+
+    async def async_save(self, data):
+        STORE_PENDING.pop(self.key, None)
+        STORE_DISK[self.key] = dict(data)
+
+    async def async_remove(self):
+        STORE_PENDING.pop(self.key, None)
+        STORE_DISK.pop(self.key, None)
+
+
+def flush_store():
+    for key, fn in list(STORE_PENDING.items()):
+        STORE_DISK[key] = dict(fn())
+    STORE_PENDING.clear()
+
+
+mod("homeassistant.helpers.storage", Store=Store)
 er = mod("homeassistant.helpers.entity_registry", async_get=lambda hass: Registry())
 sys.modules["homeassistant.helpers"].entity_registry = er
 mod("homeassistant.helpers.entity_platform", AddEntitiesCallback=object)
@@ -483,10 +519,13 @@ CREDS = [
 ]
 
 
-def make():
+def make(*, keep_store=False):
     global DISPATCH
     DISPATCH.clear()
     CLOCK.timers.clear()
+    if not keep_store:
+        STORE_DISK.clear()
+        STORE_PENDING.clear()
     hass = types.SimpleNamespace(log=[], states=types.SimpleNamespace(
         get=lambda eid: hass._door_state))
     hass._door_state = None

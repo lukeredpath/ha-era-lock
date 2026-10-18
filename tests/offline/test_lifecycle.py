@@ -292,6 +292,8 @@ def reset(codes=(0,)):
     H.FakeClient.loop_start = connack_hook(*codes)
     H.DISPATCH.clear()
     CLOCK.timers.clear()
+    H.STORE_DISK.clear()
+    H.STORE_PENDING.clear()
 
 
 async def drain(hass):
@@ -300,9 +302,11 @@ async def drain(hass):
     await asyncio.sleep(0)
 
 
-def setup(entry=None, codes=(0,), timeout=None, auth=None):
+def setup(entry=None, codes=(0,), timeout=None, auth=None, stored=None):
     reset(codes)
     AUTH.update(auth or {})
+    if stored is not None:  # the lock state saved before this "restart"
+        H.STORE_DISK["era_lock.E1"] = dict(stored)
     hass = make_hass()
     entry = entry or FakeEntry()
     if timeout is not None:
@@ -902,12 +906,61 @@ def t_reauth_flow():
           and entry.data["session"]["token"] == "tokR", (out, flow.calls))
 
 
+def t_setup_restores_state():
+    """v0.1.4: the stored state is seeded BEFORE the listener starts and the
+    startup sync is sent, and written back on HA stop / unload."""
+    seen = {}
+    ctl_cls = init.EraController
+    real_ctl_start = ctl_cls.start
+
+    def spy_ctl_start(self):
+        seen["state_at_controller_start"] = self._state
+        return real_ctl_start(self)
+    ctl_cls.start = spy_ctl_start
+    try:
+        hass, entry, out = setup(stored={"state": "locked", "last_method": "card",
+                                         "last_user": "Spare card",
+                                         "last_device_dt": CLOCK.now - 100,
+                                         "infer_t": 0.0})
+    finally:
+        ctl_cls.start = real_ctl_start
+    c = entry.runtime_data
+    ctl = c.controller
+    client = FAKE_CLIENTS[-1]
+    # (async_setup_entry calls controller.start() before listener.start)
+    check("restore setup: seeded before the controller subscribes / listener starts",
+          seen.get("state_at_controller_start") == "locked", seen)
+    check("restore setup: LOCKED, inferred, 'Restored after restart'; sync still sent",
+          out.get("ok") is True and ctl._state == "locked" and ctl._inferred
+          and ctl._changed_by == "Restored after restart"
+          and dps_sent(client) == [{"54": "Aw=="}], (out, ctl.diagnostics()))
+    # The startup sync's replay lands on top of it through the normal path.
+    raw(ctl, type="unlock", dt=CLOCK.now - 50, fresh=False, method="card", cred=51)
+    raw(ctl, type="state_report", dt=CLOCK.now - 50, fresh=False, locked=False)
+    CLOCK.advance(3)
+    check("restore setup: buffered replay overrides the restored state",
+          ctl._state == "unlocked" and not ctl._inferred, ctl.diagnostics())
+    et, cb = hass.stop_listeners[0]
+    asyncio.run(cb(None))
+    check("restore setup: HA stop writes the current state for the next start",
+          H.STORE_DISK["era_lock.E1"]["state"] == "unlocked"
+          and H.STORE_DISK["era_lock.E1"]["last_device_dt"] == CLOCK.now - 3 - 50,
+          H.STORE_DISK.get("era_lock.E1"))
+    asyncio.run(init.async_remove_entry(hass, entry))
+    check("restore setup: removing the entry drops its stored state",
+          "era_lock.E1" not in H.STORE_DISK)
+    hass, entry, out = setup()
+    check("restore setup: nothing stored -> unknown, as before",
+          entry.runtime_data.controller._state is None)
+
+
 ALL_TESTS = [t_setup_connected, t_setup_stale_session_persisted, t_setup_auth_failed,
              t_setup_transport_not_ready, t_runtime_auth_failure,
              t_runtime_transport_failure, t_update_listener_rules, t_shutdown,
              t_wake_hygiene, t_heartbeat, t_battery_sensor, t_diagnostics_redaction,
              t_close_series, t_hold_resync_coalesces, t_hold_dp11_only_flush,
-             t_hold_reopen_and_mark_locked, t_lock_entity_snapshot, t_reauth_flow]
+             t_hold_reopen_and_mark_locked, t_lock_entity_snapshot, t_reauth_flow,
+             t_setup_restores_state]
 
 if __name__ == "__main__":
     sys.exit(H.run(ALL_TESTS))

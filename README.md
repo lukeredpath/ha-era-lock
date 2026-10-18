@@ -35,6 +35,13 @@ Wi-Fi hub and fronted by ERA's cloud. Installable via [HACS](https://hacs.xyz/).
     if the door was opened (an entry/exit — the lock then waits for a
     handle-lift) it stays **unlocked** until the lock reports; with no door
     sensor the state becomes **unknown** (**"Lock state not confirmed"**);
+  - **survives a restart**: the last known locked/unlocked state is restored
+    when Home Assistant starts, shown as inferred (**"Restored after
+    restart"**) until the lock reports — any buffered events the startup sync
+    flushes (an entry while HA was down, a re-lock) replace it as usual. An
+    unknown or offline state isn't restored, and a restored *locked* with the
+    door contact reading open comes up **unlocked** (**"Door open after
+    restart"**);
   - shows a transient **"Unlocking…"** state during the cloud round-trip;
   - with an optional **door-contact sensor**, opening the door while it is
     locked forces a sync and waits for the lock's buffered events: as soon as
@@ -73,8 +80,8 @@ Wi-Fi hub and fronted by ERA's cloud. Installable via [HACS](https://hacs.xyz/).
 
 The BLE lock buffers what happens at the door while it sleeps and only reports
 when woken, and every wake costs battery. The integration wakes it at moments
-that matter: after Home Assistant starts (state is unknown until the lock
-reports), after an unlock (to catch the auto-lock), on door open/close and the
+that matter: after Home Assistant starts (to flush anything that happened
+while it was down), after an unlock (to catch the auto-lock), on door open/close and the
 short post-close series above, and on an **idle heartbeat** — by default every
 **1 hour with a door-contact sensor** (door events already cover entries and
 exits) or every **15 minutes without one**. Leave the *Idle wake interval*
