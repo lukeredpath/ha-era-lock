@@ -379,8 +379,10 @@ def t_h6_lock_service_raises():
         err = None
     except HomeAssistantError as e:
         err = e
-    check("H6: lock.lock raises HomeAssistantError with a translation key",
-          err is not None and err.translation_domain == "era_lock"
+    check("H6/v0.1.3: lock.lock raises ServiceValidationError (not logged at "
+          "ERROR) with a translation key",
+          isinstance(err, H.ServiceValidationError)
+          and err.translation_domain == "era_lock"
           and err.translation_key == "lock_not_supported", err)
     check("H6: ...and changes nothing (state, rows, activity)",
           ctl._state == "unlocked" and len(ent.rows) == n_rows

@@ -97,6 +97,18 @@ class HomeAssistantError(Exception):
         self.translation_placeholders = translation_placeholders
 
 
+class ServiceValidationError(HomeAssistantError):
+    """Mimics HA's: a refusal of the request (not logged as an error)."""
+
+
+class ConfigEntryAuthFailed(HomeAssistantError):
+    pass
+
+
+class ConfigEntryNotReady(HomeAssistantError):
+    pass
+
+
 DISPATCH: dict[str, list] = {}
 
 
@@ -154,7 +166,10 @@ class Registry:
 mod("homeassistant")
 mod("homeassistant.core", Context=Context, Event=Event, HomeAssistant=object,
     callback=callback)
-mod("homeassistant.exceptions", HomeAssistantError=HomeAssistantError)
+mod("homeassistant.exceptions", HomeAssistantError=HomeAssistantError,
+    ServiceValidationError=ServiceValidationError,
+    ConfigEntryAuthFailed=ConfigEntryAuthFailed,
+    ConfigEntryNotReady=ConfigEntryNotReady)
 mod("homeassistant.const", Platform=Platform,
     EntityCategory=types.SimpleNamespace(DIAGNOSTIC="diagnostic", CONFIG="config"))
 mod("homeassistant.helpers")
@@ -280,6 +295,24 @@ pkg.EraConfigEntry = object
 sys.modules["era_lock"] = pkg
 mod("era_lock.eralock")
 sys.modules["era_lock.eralock"].__path__ = [PKG_DIR + "/eralock"]  # real dpmap
+
+
+# eralock/era.py needs `requests`; the error taxonomy is all the component
+# imports from it (test_cognito.py tests the real module).
+class EraError(RuntimeError):
+    pass
+
+
+class EraAuthError(EraError):
+    pass
+
+
+class EraConnectionError(EraError):
+    pass
+
+
+mod("era_lock.eralock.era", EraError=EraError, EraAuthError=EraAuthError,
+    EraConnectionError=EraConnectionError)
 mod("era_lock.coordinator", EraLockCoordinator=object)
 mod("era_lock.session", EraSessionManager=object)
 
@@ -403,7 +436,7 @@ listener_mod = importlib.import_module("era_lock.mqtt_listener")
 bs_mod = importlib.import_module("era_lock.binary_sensor")
 button_mod = importlib.import_module("era_lock.button")
 controller_mod.time = CLOCK  # controller only uses time.time()
-wake_mod.time = types.SimpleNamespace(monotonic=CLOCK.time)
+wake_mod.time = types.SimpleNamespace(monotonic=CLOCK.time, time=CLOCK.time)
 LockEvent = events.LockEvent
 
 
@@ -429,11 +462,14 @@ class Wake:
     def on_door_change(self, force=False):
         self.hass.log.append(("wake", "door", force))
 
-    def schedule_followup(self, delay=wake_mod.POST_CLOSE_SYNC_S):
-        self.hass.log.append(("wake", "followup", round(delay, 3)))
+    def schedule_close_wakes(self, elapsed=0.0):
+        self.hass.log.append(("wake", "close_series", CLOCK.now))
 
-    def cancel_followup(self):
-        self.hass.log.append(("wake", "cancel_followup"))
+    def cancel_close_wakes(self):
+        self.hass.log.append(("wake", "cancel_close_wakes"))
+
+    def hold_resync(self):
+        self.hass.log.append(("wake", "hold_resync", CLOCK.now))
 
     def on_reconnect(self):
         self.hass.log.append(("wake", "on_reconnect"))
@@ -467,8 +503,13 @@ def make():
     ent.hass = hass
     async_dispatcher_connect(hass, events.signal_event("E1"), ent._on_event)
     states = []
-    async_dispatcher_connect(hass, events.signal_state("E1"), states.append)
+
+    def _state(p):
+        states.append(p)
+        hass.log.append(("state", p, CLOCK.now))
+    async_dispatcher_connect(hass, events.signal_state("E1"), _state)
     hass.states_log = states
+    hass.async_add_executor_job = lambda f, *a: f(*a)
     # describer
     described = {}
     logbook_mod.async_describe_events(
@@ -492,8 +533,25 @@ def state_changes(hass):
     return [s for s in hass.states_log if s["cause_ctx_id"]]
 
 
+def timeline(hass):
+    """Activity lines and NEW state rows, in emission order:
+    ("line", message) / ("state", state)."""
+    out = []
+    for rec in hass.log:
+        if rec[0] == "bus" and rec[1] == const.EVENT_ACTIVITY:
+            out.append(("line", hass.describe(Event(rec[1], rec[2], rec[3]))["message"]))
+        elif rec[0] == "state" and rec[1]["cause_ctx_id"]:
+            out.append(("state", rec[1]["state"]))
+    return out
+
+
+def state_row_times(hass):
+    return [rec[2] for rec in hass.log if rec[0] == "state" and rec[1]["cause_ctx_id"]]
+
+
 def followups(hass):
-    return [r for r in hass.log if r[:2] == ("wake", "followup")]
+    """Post-close wake series started: ("wake", "close_series", at)."""
+    return [r for r in hass.log if r[:2] == ("wake", "close_series")]
 
 
 def door(hass, ctl, state, old=None):
@@ -675,57 +733,90 @@ def t_bare_dp11_wins_ordering():
           and sc[0]["changed_by"] == "Unlocked by Luke (fingerprint)", (rows, sc))
 
 
+
 def t_door_hold_fingerprint():
+    """v0.1.3 (goal 8): opening from LOCKED writes NOTHING until the flush says
+    how; a fingerprint flushed 2s after the open resolves the hold at once
+    (DOOR_SETTLE_S later): its line, THEN the unlocked row parented to it."""
     hass, ctl = make()
     ctl._state = ctl._logged_state = "locked"
     t_fp = CLOCK.now
     CLOCK.advance(4)
+    t_open = CLOCK.now
     door(hass, ctl, "on")  # opened while locked; fp still buffered
-    sc0 = state_changes(hass)
-    check("door hold: state -> unlocked immediately, forced wake",
-          len(sc0) == 1 and sc0[0]["state"] == "unlocked"
-          and ("wake", "door", True) in hass.log, (sc0, hass.log))
+    check("door hold: no state row at the open (state stays locked), forced wake",
+          not state_changes(hass) and ctl._state == "locked"
+          and ("wake", "door", True) in hass.log, (hass.states_log, hass.log))
     check("door hold: no activity row yet", not activity_rows(hass))
-    CLOCK.advance(3)  # flush lands ~3s after the wake
+    CLOCK.advance(2)  # flush lands 2s after the open
+    raw(ctl, type="state_report", dt=t_fp, locked=False)   # dp11 first in the frame
     raw(ctl, type="unlock", dt=t_fp, method="fingerprint", cred=1)
-    raw(ctl, type="state_report", dt=t_fp, locked=False)
-    CLOCK.advance(controller_mod.DOOR_HOLD_S)
+    CLOCK.advance(controller_mod.DOOR_SETTLE_S / 2)
+    check("door hold + fp: nothing written inside the flush settle",
+          not activity_rows(hass) and not state_changes(hass),
+          (activity_rows(hass), state_changes(hass)))
+    CLOCK.advance(controller_mod.DOOR_SETTLE_S)
     rows = activity_rows(hass)
+    sc = state_changes(hass)
     check("door hold + buffered fp: ONE unlock row 'Unlocked by Luke (fingerprint)', no thumbturn",
           [r[0] for r in rows] == ["Unlocked by Luke (fingerprint)"], rows)
-    check("door hold + fp: the unlocked state row links to that row's ctx",
-          sc0[0]["cause_ctx_id"] == rows[0][2], (sc0, rows))
+    check("door hold + fp: line FIRST, then ONE unlocked row parented to it, By Luke",
+          timeline(hass) == [("line", "Unlocked by Luke (fingerprint)"),
+                             ("state", "unlocked")]
+          and sc[0]["cause_ctx_id"] == rows[0][2] and sc[0]["user_id"] == "uid-luke",
+          (timeline(hass), sc))
+    check("door hold + fp: resolved ~2s after the open (not at DOOR_HOLD_S)",
+          state_row_times(hass)[0] - t_open
+          <= 2 + controller_mod.DOOR_SETTLE_S + 0.01, state_row_times(hass))
     last = hass.states_log[-1]
-    check("door hold + fp: reason refined, last_method fingerprint, by Luke",
+    check("door hold + fp: reason, last_method fingerprint, by Luke, device-reported",
           last["changed_by"] == "Unlocked by Luke (fingerprint)"
           and last["last_method"] == "fingerprint" and last["last_user"] == "Luke"
-          and ctl._state == "unlocked", last)
+          and last["inferred"] is False and ctl._state == "unlocked", last)
+    CLOCK.advance(controller_mod.DOOR_HOLD_RESYNC_S)
+    check("door hold + fp: resolved, so no mid-hold re-sync",
+          not any(r[:2] == ("wake", "hold_resync") for r in hass.log))
     door(hass, ctl, "off")
-    check("door hold resolved to a credential (coming IN): NO post-close re-sync",
-          not followups(hass), followups(hass))
+    check("v0.1.3: a credential ENTRY's close also starts the post-close wakes",
+          len(followups(hass)) == 1, followups(hass))
     CLOCK.advance(120)
-    check("door hold + fp: still exactly one unlock row afterwards",
-          [r[0] for r in activity_rows(hass)] == ["Unlocked by Luke (fingerprint)"],
-          activity_rows(hass))
+    check("door hold + fp: still exactly one unlock row / state row afterwards",
+          [r[0] for r in activity_rows(hass)] == ["Unlocked by Luke (fingerprint)"]
+          and len(state_changes(hass)) == 1,
+          (activity_rows(hass), state_changes(hass)))
+
 
 
 def t_door_hold_thumbturn():
+    """Nothing flushed: one extra sync mid-hold, then at DOOR_HOLD_S the
+    thumbturn line and THEN the unlocked row parented to it."""
     hass, ctl = make()
     ctl._state = ctl._logged_state = "locked"
+    t_open = CLOCK.now
     door(hass, ctl, "on")
-    sc0 = state_changes(hass)
-    CLOCK.advance(controller_mod.DOOR_HOLD_S - 0.5)
-    check("door hold (nothing flushed): no row before the window expires",
-          not activity_rows(hass))
+    CLOCK.advance(controller_mod.DOOR_HOLD_RESYNC_S + 0.1)
+    rs = [r for r in hass.log if r[:2] == ("wake", "hold_resync")]
+    check("door hold (nothing flushed): one forced re-sync at DOOR_HOLD_RESYNC_S",
+          len(rs) == 1 and abs(rs[0][2] - t_open - controller_mod.DOOR_HOLD_RESYNC_S)
+          < 0.01, rs)
+    CLOCK.advance(controller_mod.DOOR_HOLD_S - controller_mod.DOOR_HOLD_RESYNC_S - 0.6)
+    check("door hold (nothing flushed): no row, no state change before the window expires",
+          not activity_rows(hass) and not state_changes(hass)
+          and ctl._state == "locked")
     CLOCK.advance(1)
     rows = activity_rows(hass)
+    sc = state_changes(hass)
     check("door hold (nothing flushed): 'Unlocked (thumbturn)' after the window",
           [r[0] for r in rows] == ["Unlocked (thumbturn)"], rows)
-    check("door hold thumbturn: state row links to it; last_method thumbturn",
-          sc0[0]["cause_ctx_id"] == rows[0][2]
+    check("door hold thumbturn: line then unlocked row (parented), inferred, last_method thumbturn",
+          timeline(hass) == [("line", "Unlocked (thumbturn)"), ("state", "unlocked")]
+          and sc[0]["cause_ctx_id"] == rows[0][2] and sc[0]["inferred"] is True
           and hass.states_log[-1]["last_method"] == "thumbturn"
           and hass.states_log[-1]["changed_by"] == "Unlocked (thumbturn)",
-          (sc0, hass.states_log[-1]))
+          (timeline(hass), hass.states_log[-1]))
+    check("door hold thumbturn: at DOOR_HOLD_S after the open",
+          abs(state_row_times(hass)[0] - t_open - controller_mod.DOOR_HOLD_S) < 0.01,
+          state_row_times(hass))
 
 
 def t_door_hold_intervening_lock():
@@ -818,14 +909,14 @@ def t_door_close_never_unlocks_locked():
 
 
 # ============================================================ fix 1: hold vs lock
+
 def t_hold_then_live_lock_thumbturn():
     """Live: door opened while locked, closed at +6, handle lifted -> dp11:true
-    live at +9 (inside the 10s hold). Unlock line must precede the lock line."""
+    live at +9 (inside the hold). Unlock line + unlocked row first, then the
+    lock line + locked row."""
     hass, ctl = make()
     ctl._state = ctl._logged_state = "locked"
-    t_open = CLOCK.now
     door(hass, ctl, "on")
-    sc0 = state_changes(hass)
     CLOCK.advance(6)
     door(hass, ctl, "off")
     CLOCK.advance(3)
@@ -837,12 +928,15 @@ def t_hold_then_live_lock_thumbturn():
     check("fix1: no second unlock line when the hold timer would have expired",
           sum(1 for r in rows if r[0].startswith("Unlocked")) == 1, rows)
     sc = state_changes(hass)
-    check("fix1: unlocked row parents to the thumbturn line, locked row to the lock line",
-          [s["state"] for s in sc] == ["unlocked", "locked"]
-          and sc[0]["cause_ctx_id"] == rows[0][2] == sc0[0]["cause_ctx_id"]
-          and sc[1]["cause_ctx_id"] == rows[1][2], (sc, rows))
-    check("fix1: lock-up already seen -> no post-close re-sync",
-          not followups(hass), followups(hass))
+    check("goal8: unlock line, unlocked row, lock line, locked row — in that order",
+          timeline(hass) == [("line", "Unlocked (thumbturn)"), ("state", "unlocked"),
+                             ("line", "Device locked"), ("state", "locked")]
+          and sc[0]["cause_ctx_id"] == rows[0][2]
+          and sc[1]["cause_ctx_id"] == rows[1][2], (timeline(hass), sc, rows))
+    check("v0.1.3: the close (hold pending) started the post-close wakes; the "
+          "settled lock cancelled the rest",
+          len(followups(hass)) == 1 and ("wake", "cancel_close_wakes") in hass.log,
+          followups(hass))
     check("fix1: ends locked (device's word)", ctl._state == "locked")
 
 
@@ -901,18 +995,23 @@ def t_hold_lock_within_slack_after_close():
 
 
 # ====================================================== fix 2: exit re-sync only
+
 def t_exit_resync_close_before_resolve():
+    """v0.1.3 (replaces the +60s exit re-sync): a close while a hold is pending
+    starts the post-close series AT the close."""
     hass, ctl = make()
     ctl._state = ctl._logged_state = "locked"
     door(hass, ctl, "on")
     CLOCK.advance(6)
+    t_close = CLOCK.now
     door(hass, ctl, "off")
-    check("fix2: close before resolution schedules nothing yet", not followups(hass),
-          followups(hass))
-    CLOCK.advance(controller_mod.DOOR_HOLD_S)  # resolves at +10 -> thumbturn
     fu = followups(hass)
-    check("fix2: thumbturn resolved after close -> ONE re-sync, timed 60s from the close (56s at +10)",
-          len(fu) == 1 and fu[0][2] == 56.0, fu)
+    check("close series: close during a hold -> series started at the close",
+          len(fu) == 1 and fu[0][2] == t_close, fu)
+    CLOCK.advance(controller_mod.DOOR_HOLD_S)  # resolves -> thumbturn
+    check("close series: the hold resolving adds no second series",
+          len(followups(hass)) == 1, followups(hass))
+
 
 
 def t_exit_resync_close_after_resolve():
@@ -920,18 +1019,24 @@ def t_exit_resync_close_after_resolve():
     ctl._state = ctl._logged_state = "locked"
     door(hass, ctl, "on")
     CLOCK.advance(controller_mod.DOOR_HOLD_S + 2)  # thumbturn, door still open
-    check("fix2: thumbturn resolved, door open -> not yet", not followups(hass))
+    check("close series: thumbturn resolved, door open -> not yet", not followups(hass))
     door(hass, ctl, "off")
-    fu = followups(hass)
-    check("fix2: close after thumbturn resolution -> re-sync in 60s",
-          len(fu) == 1 and fu[0][2] == 60.0, fu)
-    door(hass, ctl, "on")
-    door(hass, ctl, "off")
-    check("fix2: a later ordinary open/close doesn't re-arm it", len(followups(hass)) == 1,
+    check("close series: close while UNLOCKED -> series", len(followups(hass)) == 1,
           followups(hass))
+    n_cancel = hass.log.count(("wake", "cancel_close_wakes"))
+    CLOCK.advance(5)
+    door(hass, ctl, "on")
+    check("close series: a reopen cancels the rest of the series",
+          hass.log.count(("wake", "cancel_close_wakes")) == n_cancel + 1)
+    door(hass, ctl, "off")
+    check("close series: ...and the next close starts a new one",
+          len(followups(hass)) == 2, followups(hass))
+
 
 
 def t_exit_resync_not_for_credential_close_before():
+    """v0.1.3: entries (credential) get the post-close series too (was: exits
+    only)."""
     hass, ctl = make()
     ctl._state = ctl._logged_state = "locked"
     t_fp = CLOCK.now
@@ -943,9 +1048,19 @@ def t_exit_resync_not_for_credential_close_before():
     door(hass, ctl, "off")
     CLOCK.advance(controller_mod.DOOR_HOLD_S)
     rows = [r[0] for r in activity_rows(hass)]
-    check("fix2: card entry, close before resolve -> card line, NO re-sync",
-          rows == ["Unlocked by Spare card (card)"] and not followups(hass),
+    check("close series: card entry -> card line, and its close starts the series",
+          rows == ["Unlocked by Spare card (card)"] and len(followups(hass)) == 1,
           (rows, followups(hass)))
+    hass, ctl = make()
+    ctl._state = ctl._logged_state = "locked"
+    door(hass, ctl, "off", old="on")
+    check("close series: a close while LOCKED (no hold) starts nothing",
+          not followups(hass), followups(hass))
+    hass, ctl = make()
+    door(hass, ctl, "off", old="on")
+    check("close series: a close from UNKNOWN starts it",
+          len(followups(hass)) == 1, followups(hass))
+
 
 
 def t_fresh_lock_cancels_followup():
@@ -954,10 +1069,10 @@ def t_fresh_lock_cancels_followup():
     raw(ctl, type="state_report", dt=CLOCK.now, locked=True)
     # v0.1.2 (H3): a live lock's side effects wait for the debounce to settle
     check("fix2: ...not before the lock settles (bounce guard)",
-          ("wake", "cancel_followup") not in hass.log)
+          ("wake", "cancel_close_wakes") not in hass.log)
     CLOCK.advance(controller_mod.DEVICE_DEBOUNCE_S + 0.1)
-    check("fix2: a live device lock cancels any pending post-close re-sync",
-          ("wake", "cancel_followup") in hass.log)
+    check("close series: a settled device lock cancels the rest of the series",
+          ("wake", "cancel_close_wakes") in hass.log)
 
 
 # ======================================================= fix 3: wake coalescing
@@ -976,21 +1091,20 @@ def make_wake():
     return wake_mod.EraWakeManager(hass, lst, heartbeat_s=0), lst
 
 
+
 def t_wake_coalesce():
     wm, lst = make_wake()
-    # live: door close at T (thumbturn exit) -> +60s re-sync; an HA unlock at
-    # T+30.6 -> +30s relock poll lands 0.6s after the re-sync.
-    wm.schedule_followup(60)
-    CLOCK.advance(30.6)
+    # A door close at T starts +10/+20/+30; an HA unlock at T+0.5 arms the
+    # relock polls at +30.5/+40.5/+50.5. The +30.5 poll merges into the +30
+    # close wake (0.5s apart, inside the coalescing window).
+    t0 = CLOCK.now
+    wm.schedule_close_wakes()
+    CLOCK.advance(0.5)
     wm.on_unlock()
-    CLOCK.advance(29.4)  # re-sync fires
-    CLOCK.advance(0.6)   # +30s poll fires 0.6s later
-    check("fix3: re-sync + relock poll 0.6s apart -> ONE wake sent",
-          len(lst.wakes) == 1, lst.wakes)
-    CLOCK.advance(10)    # +40s poll
-    CLOCK.advance(10)    # +50s poll
-    check("fix3: later polls (10s apart) still each wake",
-          len(lst.wakes) == 3, lst.wakes)
+    CLOCK.advance(60)
+    got = [round(w - t0, 1) for w in lst.wakes]
+    check("close series + relock polls: 10/20/30 then 40.5/50.5 (the +30.5 poll merged)",
+          got == [10.0, 20.0, 30.0, 40.5, 50.5], got)
 
 
 def t_wake_coalesce_boundary():
@@ -1024,6 +1138,8 @@ def make_listener(lock_id="LOCKDEV"):
     lst._helper = types.SimpleNamespace(cid="CID1")
     lst._roster = {}
     lst._lock_dev_id = lock_id
+    lst._wake_manager = None
+    lst.stats = __import__("collections").defaultdict(int)
     out = []
     lst._emit = out.append
     return lst, out
@@ -1517,6 +1633,10 @@ def t_mqtt_frames_still_delivered():
             f(*a)
     CLOCK.advance(3)
     evs = [a[2] for f, a in queued]
+    check("v0.1.3: the wake's DP dump (dp8) is dispatched as a battery reading",
+          [(e.type, e.value) for e in evs if e.type == "battery"] == [("battery", 90)],
+          evs)
+    evs = [e for e in evs if e.type != "battery"]
     check("mqtt: frames seen during an unlock still reach the dispatcher "
           "(state_report + remote unlock from the echo)",
           [e.type for e in evs] == ["state_report", "unlock"]

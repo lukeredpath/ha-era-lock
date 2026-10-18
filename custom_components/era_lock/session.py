@@ -15,17 +15,22 @@ Credential model (validated 2026-10-15):
 """
 from __future__ import annotations
 
+import logging
 import time
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 
 from .eralock.era import (
     EraAuthError,
+    EraConnectionError,
     cognito_login,
     cognito_refresh,
     fetch_tuya_creds,
 )
 from .eralock.login import TuyaLogin
 from .eralock.session import Session, derive_mqtt_secrets
+
+_LOGGER = logging.getLogger(__name__)
 
 # Keys we read out of the pasted sign_secrets blob to drive the ERA bridge.
 _ERA_CFG_KEYS = ("cognito_client_id", "cognito_region", "appsync_url")
@@ -67,6 +72,11 @@ class EraSessionManager:
     session: Session
     _id_token: str | None = None
     _id_token_exp: float = 0.0
+    # Called (on the calling thread — paho / executor) with
+    # ``entry_credentials()`` after every successful re-mint, so the component
+    # can persist them to the config entry. Must not raise / block.
+    on_credentials_changed: Callable[[dict], None] | None = field(
+        default=None, repr=False, compare=False)
 
     @property
     def era(self) -> dict:
@@ -85,13 +95,44 @@ class EraSessionManager:
         return self._id_token
 
     def refresh_tuya_session(self) -> Session:
-        """Re-mint the Tuya session (AppSync tpassword -> Tuya login)."""
+        """Re-mint the Tuya session (AppSync tpassword -> Tuya login).
+
+        Error contract (the listener latches + starts reauth on EraAuthError
+        only): ``EraAuthError`` means the ACCOUNT rejected us — the Cognito
+        refresh token is expired/revoked, which only re-entering the password
+        fixes. An AppSync rejection is retried once with a freshly refreshed
+        idToken (a cached one may have been revoked); if Cognito accepts us
+        but AppSync still refuses, a new password can't help (reauth re-runs
+        the same chain), so it is reported as ``EraConnectionError`` and
+        retried with backoff rather than parking the integration on a reauth.
+        Tuya login failures likewise propagate as non-auth errors."""
         era = self.era
+
+        def fetch(id_token: str) -> dict:
+            return fetch_tuya_creds(id_token, self.email, appsync_url=era["appsync_url"],
+                                    device_id=era["device_id"],
+                                    device_type=era["era_device_type"])
+
         id_token = self.ensure_id_token()
-        creds = fetch_tuya_creds(id_token, self.email, appsync_url=era["appsync_url"],
-                                 device_id=era["device_id"], device_type=era["era_device_type"])
+        try:
+            creds = fetch(id_token)
+        except EraAuthError:
+            self._id_token = None
+            id_token = self.ensure_id_token()  # EraAuthError here is genuine
+            try:
+                creds = fetch(id_token)
+            except EraAuthError as e:
+                raise EraConnectionError(
+                    f"ERA AppSync refused a freshly refreshed sign-in: {e}") from e
         self.session = TuyaLogin(sign_secrets=self.sign_secrets,
                                  tuid=creds["tuid"]).login_session(creds["tpassword"])
+        cb = self.on_credentials_changed
+        if cb is not None:
+            try:
+                cb(self.entry_credentials())
+            except Exception:  # noqa: BLE001 — persistence must never break a re-mint
+                _LOGGER.exception(
+                    "ERA: could not hand re-minted credentials to the config entry")
         return self.session
 
     def mqtt_secrets(self) -> dict:

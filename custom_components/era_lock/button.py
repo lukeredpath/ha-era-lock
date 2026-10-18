@@ -44,9 +44,11 @@ class EraSyncButton(ButtonEntity):
         self._attr_device_info = device_info(entry)
 
     async def async_press(self) -> None:
-        listener = self._coordinator.listener
-        if listener is not None:
-            await self.hass.async_add_executor_job(listener.wake)
+        # Through the wake manager: coalesced with a wake sent moments ago, and
+        # counted for the idle heartbeat.
+        wake = self._coordinator.wake
+        if wake is not None:
+            wake.manual_sync()
 
 
 class EraMarkLockedButton(ButtonEntity):

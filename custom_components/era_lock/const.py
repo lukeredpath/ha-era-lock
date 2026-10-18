@@ -38,6 +38,36 @@ CONF_CREDENTIALS = "credentials"  # [{method, id, label, user_id?, user_name?}]
 # dpmap.METHOD_DP_LABELS so a label resolves against inbound unlock events.
 CREDENTIAL_METHODS = ("fingerprint", "card", "ble")
 
-DEFAULT_SCAN_INTERVAL = 1800          # 30 min local LAN poll (battery is slow)
+# Local LAN poll: only a fallback for the battery % — the lock reports dp8 over
+# cloud MQTT whenever it wakes, which the battery sensor uses directly.
+DEFAULT_SCAN_INTERVAL = 6 * 3600
 DEFAULT_AUTO_RELOCK_SECONDS = 60      # failsafe relock timer (min 60s; device dp11 wins)
-DEFAULT_WAKE_HEARTBEAT = 900          # idle wake interval (0 = off); battery vs latency
+# Idle wake interval (0 = off); battery vs latency. Its job is to flush events
+# the lock buffered while asleep that nothing else prompted a wake for. With a
+# door contact, every entry/exit already forces wakes (open, close, the
+# post-close series), so the heartbeat is only a safety net: 1h. Without one,
+# a buffered credential entry is only seen by the heartbeat: keep 15 min.
+DEFAULT_WAKE_HEARTBEAT = 900
+DEFAULT_WAKE_HEARTBEAT_WITH_DOOR = 3600
+
+
+def default_wake_heartbeat(options) -> int:
+    """The idle-wake default for these options (door contact or not)."""
+    if options.get(CONF_DOOR_CONTACT_ENTITY_ID):
+        return DEFAULT_WAKE_HEARTBEAT_WITH_DOOR
+    return DEFAULT_WAKE_HEARTBEAT
+
+
+def wake_heartbeat(options) -> int:
+    """The configured idle-wake interval, else the default for the options."""
+    v = options.get(CONF_WAKE_HEARTBEAT)
+    if v is None:
+        return default_wake_heartbeat(options)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default_wake_heartbeat(options)
+
+# Setup: how long to wait for the cloud MQTT connection (incl. a session
+# re-mint if the stored one is stale) before ConfigEntryNotReady.
+STARTUP_CONNECT_TIMEOUT_S = 20.0

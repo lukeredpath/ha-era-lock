@@ -52,7 +52,6 @@ from .const import (
     CONF_WAKE_HEARTBEAT,
     CREDENTIAL_METHODS,
     DEFAULT_AUTO_RELOCK_SECONDS,
-    DEFAULT_WAKE_HEARTBEAT,
     DOMAIN,
 )
 from .eralock.era import EraAuthError, EraConnectionError, EraError
@@ -225,14 +224,18 @@ class EraLockConfigFlow(ConfigFlow, domain=DOMAIN):
             except _ValidationError as e:
                 errors["base"] = e.code
             else:
-                return self.async_update_reload_and_abort(
-                    entry,
-                    data={
-                        **entry.data,
-                        CONF_ERA: {"refresh_token": creds["refresh_token"], "email": email},
-                        CONF_SESSION: creds["session"].to_dict(),
-                    },
-                )
+                data = {
+                    **entry.data,
+                    CONF_ERA: {"refresh_token": creds["refresh_token"], "email": email},
+                    CONF_SESSION: creds["session"].to_dict(),
+                }
+                if entry.update_listeners:
+                    # Loaded (the session died at runtime): the entry's update
+                    # listener sees credentials it didn't persist itself and
+                    # reloads (HA wants listener-owned reloads, not both).
+                    return self.async_update_and_abort(entry, data=data)
+                # Setup failed (ConfigEntryAuthFailed): no listener — reload here.
+                return self.async_update_reload_and_abort(entry, data=data)
         return self.async_show_form(
             step_id="reauth_confirm",
             data_schema=vol.Schema({vol.Required(CONF_PASSWORD): str}),
@@ -305,9 +308,12 @@ class EraLockOptionsFlow(OptionsFlow):
                 description={"suggested_value": o.get(CONF_DOOR_CONTACT_ENTITY_ID)},
             ): EntitySelector(EntitySelectorConfig(
                 domain="binary_sensor", device_class="door")),
-            vol.Required(
+            # Optional: left empty, the default follows the door contact (see
+            # const.default_wake_heartbeat), so adding/removing a door sensor
+            # retunes it — a stored value is only ever an explicit choice.
+            vol.Optional(
                 CONF_WAKE_HEARTBEAT,
-                default=o.get(CONF_WAKE_HEARTBEAT, DEFAULT_WAKE_HEARTBEAT),
+                description={"suggested_value": o.get(CONF_WAKE_HEARTBEAT)},
             ): NumberSelector(NumberSelectorConfig(
                 min=0, max=3600, step=60, mode=NumberSelectorMode.BOX,
                 unit_of_measurement="s")),

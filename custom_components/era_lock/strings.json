@@ -91,7 +91,7 @@
         "data": {
           "auto_relock_seconds": "Relock failsafe (seconds, min 60)",
           "door_contact_entity_id": "Door contact sensor (optional)",
-          "wake_heartbeat_seconds": "Idle wake interval (seconds, 0 = off)"
+          "wake_heartbeat_seconds": "Idle wake interval (seconds, 0 = off; leave empty for the default: 1 hour with a door sensor, 15 minutes without)"
         }
       },
       "credentials": {

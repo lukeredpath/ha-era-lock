@@ -9,6 +9,15 @@ Runs a paho client in its own thread (paho-managed); callbacks bridge back to
 the HA loop with ``call_soon_threadsafe``. On an auth failure (expired session
 creds) it re-mints the Tuya session and reconnects.
 
+Auth lifecycle: a re-mint the ERA account REJECTS (:class:`EraAuthError` — the
+Cognito refresh token or the AppSync lookup refused) is terminal: the listener
+latches ``auth_failed``, disconnects (so paho stops retrying — no hot loop of
+doomed refreshes), never restarts (watchdog included) and tells the component
+once via ``on_auth_failed`` (HA loop), which starts the reauth flow. A
+TRANSPORT failure (:class:`EraConnectionError`, DNS, timeouts, Tuya login
+errors) is not latched: paho's own reconnect backoff (2s..120s) retries, and
+each retry re-mints at most once per REFRESH_REUSE_S.
+
 Resilience: paho re-raises callback exceptions out of ``loop_forever`` by
 default, which kills its network thread for good — silently. Every paho
 callback here therefore catches + logs (``_LOGGER.exception``) and carries on,
@@ -41,6 +50,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_time_interval
 
 from .eralock import dpmap
+from .eralock.era import EraAuthError
 from .eralock.mqtt import UNLOCK_ECHO, CloudMqttLock, MqttUnlockError, UnlockTracker
 from .events import LockEvent, signal_raw
 from .session import EraSessionManager
@@ -58,6 +68,8 @@ CONNECT_WAIT_S = 10.0
 REFRESH_REUSE_S = 30.0
 # How often the HA-side watchdog checks that paho's network thread is alive.
 WATCHDOG_INTERVAL_S = 60
+# stop(): how long to wait for paho's network thread to exit.
+STOP_JOIN_S = 5.0
 
 
 def _num(v) -> float | int | None:
@@ -78,6 +90,17 @@ def _alarm_value(raw):
         except Exception:  # noqa: BLE001
             return raw
     return raw
+
+
+def _battery_value(raw) -> int | None:
+    """dp8 battery % (an int over MQTT; tolerate a numeric string)."""
+    if isinstance(raw, bool):
+        return None
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return v if 0 <= v <= 100 else None
 
 
 def _truthy(v) -> bool:
@@ -136,6 +159,20 @@ class EraMqttListener:
         # (the broker allows one connection per clientId).
         self._lifecycle_lock = threading.Lock()
         self._restarting = False  # a watchdog restart is queued/running
+        # Auth lifecycle (see module docstring). ``on_auth_failed(message)`` is
+        # called ONCE, on the HA loop, when the account rejects a re-mint.
+        self.on_auth_failed: Callable[[str], None] | None = None
+        self._auth_error: str | None = None
+        # Set on the first CONNACK rc=0 or a terminal auth failure, for the
+        # setup-time wait (wait_first_outcome).
+        self._outcome = threading.Event()
+        self._ever_connected = False
+        # Diagnostics (read on the loop; plain assignments from paho's thread).
+        self.stats: dict = {"connects": 0, "disconnects": 0, "auth_refusals": 0,
+                            "remints": 0, "remint_failures": 0, "wakes_sent": 0,
+                            "wakes_skipped": 0, "frames": 0, "lock_frames": 0,
+                            "last_connect": None, "last_disconnect": None,
+                            "last_lock_frame": None, "last_remint_error": None}
 
     def set_wake_manager(self, wake_manager) -> None:
         self._wake_manager = wake_manager
@@ -165,17 +202,88 @@ class EraMqttListener:
         client.on_message = self._on_message
         client.on_disconnect = self._on_disconnect
         client.connect_async(host, int(port), keepalive=mq.get("keepAlive", 60))
-        client.loop_start()
+        # Publish the client BEFORE its network thread starts: the first
+        # callbacks (e.g. a refused CONNACK -> re-mint -> _apply_creds) use it.
         self._client = client
+        client.loop_start()
         _LOGGER.debug("ERA MQTT listener started")
 
     def stop(self) -> None:
+        """Stop for good (unload / HA stop). Blocking: run in an executor.
+
+        Disconnect FIRST (queues the DISCONNECT packet and moves paho to
+        "disconnecting", so its loop exits instead of reconnecting), then stop
+        the network thread with a BOUNDED wait (paho's own ``loop_stop`` joins
+        without a timeout). If a session re-mint is in flight on paho's thread
+        (blocking HTTPS inside on_connect) the wait simply times out: the thread
+        is a daemon, its result is discarded (``_closing`` — no creds applied,
+        no reconnect) and it exits as soon as that call returns."""
         with self._lifecycle_lock:
             self._closing = True
             self._connected.clear()
-            if self._client is not None:
-                self._client.loop_stop()
-                self._client.disconnect()
+            client = self._client
+            if client is None:
+                return
+            try:
+                client.disconnect()
+            except Exception:  # noqa: BLE001 — best effort
+                _LOGGER.debug("ERA MQTT: disconnect on stop failed", exc_info=True)
+            thread = getattr(client, "_thread", None)
+            if isinstance(thread, threading.Thread):
+                if thread is not threading.current_thread():
+                    client._thread_terminate = True  # noqa: SLF001 — paho 2.x
+                    thread.join(STOP_JOIN_S)
+                    if thread.is_alive():
+                        _LOGGER.debug("ERA MQTT: network thread still busy "
+                                      "(re-mint in flight); left to exit")
+                return
+            try:
+                client.loop_stop()
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug("ERA MQTT: loop_stop on stop failed", exc_info=True)
+
+    # -- auth lifecycle -------------------------------------------------------
+    @property
+    def auth_failed(self) -> bool:
+        return self._auth_error is not None
+
+    @property
+    def auth_error(self) -> str | None:
+        return self._auth_error
+
+    def wait_first_outcome(self, timeout: float) -> str:
+        """Blocking (executor): wait for the first CONNACK rc=0 or a terminal
+        auth failure. Returns "connected", "auth_failed" or "timeout"."""
+        self._outcome.wait(timeout)
+        if self._auth_error is not None:
+            return "auth_failed"
+        if self._ever_connected:
+            # (even if it has dropped again since: paho reconnects by itself)
+            return "connected"
+        return "timeout"
+
+    def _latch_auth_failure(self, err: Exception) -> None:
+        """The ERA account rejected a re-mint: stop for good and report once
+        (any thread). Disconnecting puts paho in "disconnecting", so its loop
+        exits instead of retrying; the watchdog never restarts it."""
+        if self._auth_error is not None:
+            return
+        self._auth_error = str(err) or type(err).__name__
+        self._connected.clear()
+        self._outcome.set()
+        _LOGGER.error("ERA account rejected the stored credentials (%s); stopping "
+                      "the cloud connection until you re-authenticate",
+                      self._auth_error)
+        client = self._client
+        if client is not None:
+            try:
+                client.disconnect()
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug("ERA MQTT: disconnect after auth failure failed",
+                              exc_info=True)
+        cb = self.on_auth_failed
+        if cb is not None and not self._closing:
+            self.hass.loop.call_soon_threadsafe(cb, self._auth_error)
 
     # -- watchdog -----------------------------------------------------------------
     @staticmethod
@@ -197,7 +305,8 @@ class EraMqttListener:
 
     @callback
     def _async_watchdog(self, _now=None) -> None:
-        if self._closing or self._restarting or self._client is None or self.alive:
+        if (self._closing or self._restarting or self._client is None
+                or self._auth_error is not None or self.alive):
             return
         _LOGGER.warning("ERA MQTT listener thread has stopped; restarting it")
         self._restarting = True
@@ -219,7 +328,7 @@ class EraMqttListener:
         clientId; then a fresh client is started exactly as at setup. A no-op
         when closing, or if the thread turns out to be alive after all."""
         with self._lifecycle_lock:
-            if self._closing:
+            if self._closing or self._auth_error is not None:
                 return
             old = self._client
             if old is not None and self._thread_alive(old):
@@ -245,9 +354,16 @@ class EraMqttListener:
         Use sparingly — waking the BLE lock costs battery.
         """
         from .eralock.mqtt import WAKE_DPS
-        if self._client is None:
+        client = self._client
+        if (client is None or self._closing or self._auth_error is not None
+                or not self._connected.is_set()):
+            # A QoS-1 publish while disconnected is queued by paho and sent on
+            # reconnect — a stale wake, possibly much later. Skip it instead.
+            self.stats["wakes_skipped"] += 1
+            _LOGGER.debug("ERA MQTT: not connected; wake/synch skipped")
             return
-        self._helper._publish(self._client, WAKE_DPS)
+        self._helper._publish(client, WAKE_DPS)
+        self.stats["wakes_sent"] += 1
         _LOGGER.debug("ERA MQTT: sent wake/synch (dp54)")
 
     @property
@@ -269,6 +385,9 @@ class EraMqttListener:
         """
         kw.setdefault("settle", 0.0)  # persistent connection: nothing to flush
         with self._unlock_lock:
+            if self._auth_error is not None:
+                raise MqttUnlockError(
+                    "ERA sign-in expired — re-authenticate the integration")
             if self._client is None or self._closing:
                 raise MqttUnlockError("ERA MQTT listener is not running")
             if not self._connected.wait(connect_wait):
@@ -334,10 +453,14 @@ class EraMqttListener:
     def refresh_session(self) -> None:
         """Re-mint the Tuya session and apply its MQTT creds to THIS client
         (blocking: run in an executor). If the listener is down, paho's own
-        reconnect loop then connects with them; no second client is opened."""
+        reconnect loop then connects with them; no second client is opened.
+
+        Raises EraAuthError (after latching, see _latch_auth_failure) when the
+        account rejects it, or the transport error."""
         with self._session_lock:
             self._remint()
-            self._apply_creds()
+            if not self._closing:
+                self._apply_creds()
 
     # -- paho callbacks (paho thread) ----------------------------------------
     # Each body is wrapped: an exception escaping a paho callback would end
@@ -354,16 +477,25 @@ class EraMqttListener:
             for topic in self._helper.in_topics:
                 client.subscribe(topic, qos=1)
             self._connected.set()
+            self._ever_connected = True
+            self._outcome.set()
+            self.stats["connects"] += 1
+            self.stats["last_connect"] = time.time()
             _LOGGER.debug("ERA MQTT connected; subscribed to %s", self._helper.in_topics)
         else:
             self._connected.clear()
+            self.stats["auth_refusals"] += 1
+            if self._closing or self._auth_error is not None:
+                return
             _LOGGER.warning("ERA MQTT auth failed (rc=%s); refreshing session", rc)
             self._refresh_and_reconnect()
 
     def _on_disconnect(self, client, userdata, *args) -> None:
         try:
             self._connected.clear()
-            if not self._closing:
+            self.stats["disconnects"] += 1
+            self.stats["last_disconnect"] = time.time()
+            if not self._closing and self._auth_error is None:
                 _LOGGER.debug("ERA MQTT disconnected; paho will retry")
         except Exception:  # noqa: BLE001
             _LOGGER.exception("ERA MQTT: error in on_disconnect")
@@ -376,8 +508,7 @@ class EraMqttListener:
                               getattr(msg, "topic", "?"))
 
     def _handle_message(self, msg) -> None:
-        if self._wake_manager is not None:
-            self._wake_manager.note_inbound()
+        self.stats["frames"] += 1
         payload = self._helper._decrypt(msg.payload)
         if not payload:
             return
@@ -417,6 +548,13 @@ class EraMqttListener:
         dps = data.get("dps")
         if data.get("cid") != self._helper.cid or not isinstance(dps, dict):
             return
+        # Only a DP frame from OUR lock is lock activity for the idle heartbeat
+        # (hub presence / other sub-devices' chatter says nothing about whether
+        # the lock has reported recently).
+        self.stats["lock_frames"] += 1
+        self.stats["last_lock_frame"] = time.time()
+        if self._wake_manager is not None:
+            self._wake_manager.note_inbound()
 
         # Timestamps are validated: a non-numeric one falls back (the frame
         # time to HA's clock; a DP time to the frame time) rather than raising.
@@ -491,6 +629,14 @@ class EraMqttListener:
                 type="tamper", subtype="hijack", dt=dt, fresh=fresh,
                 source="device"))
 
+        # dp8 = battery %, reported with the lock's DP dump on a wake: feeds the
+        # battery sensor without a LAN poll.
+        if "8" in dps:
+            battery = _battery_value(dps["8"])
+            if battery is not None:
+                self._emit(LockEvent(type="battery", value=battery,
+                                     dt=tmap.get("8", frame_t), source="device"))
+
     # -- link state (hub's view of the BLE lock) -------------------------------
     def _handle_presence(self, data: dict, frame_t) -> None:
         """protocol:25 — the hub's sub-device presence list:
@@ -542,11 +688,25 @@ class EraMqttListener:
     # -- recovery -------------------------------------------------------------
     def _remint(self) -> None:
         """Re-mint the Tuya session unless one was just minted (caller holds
-        ``_session_lock``)."""
+        ``_session_lock``). A rejection by the ERA account latches the auth
+        failure (no further attempts) and re-raises."""
+        if self._auth_error is not None:
+            raise EraAuthError(self._auth_error)
         now = time.monotonic()
         if self._refreshed_at is not None and now - self._refreshed_at < REFRESH_REUSE_S:
             return
-        self.mgr.refresh_tuya_session()
+        self.stats["remints"] += 1
+        try:
+            self.mgr.refresh_tuya_session()
+        except EraAuthError as e:
+            self.stats["remint_failures"] += 1
+            self.stats["last_remint_error"] = type(e).__name__
+            self._latch_auth_failure(e)
+            raise
+        except Exception as e:
+            self.stats["remint_failures"] += 1
+            self.stats["last_remint_error"] = type(e).__name__
+            raise
         self._refreshed_at = time.monotonic()
 
     def _apply_creds(self) -> None:
@@ -559,8 +719,29 @@ class EraMqttListener:
         try:
             with self._session_lock:
                 self._remint()
+                if self._closing:
+                    return  # stopped while the re-mint ran: discard it
                 self._apply_creds()
             assert self._client is not None
             self._client.reconnect()
+        except EraAuthError:
+            return  # latched + logged once in _latch_auth_failure
         except Exception as e:  # noqa: BLE001
-            _LOGGER.error("ERA MQTT session refresh failed: %s", e)
+            # Transport (ERA/Tuya unreachable, ...): paho's reconnect backoff
+            # retries; the next refused CONNACK re-mints again.
+            _LOGGER.warning("ERA MQTT session refresh failed (will retry): %s", e)
+
+    # -- diagnostics ----------------------------------------------------------
+    def diagnostics(self) -> dict:
+        """Non-secret runtime state for the diagnostics platform."""
+        return {
+            "running": self._client is not None and not self._closing,
+            "thread_alive": self.alive,
+            "connected": self.connected,
+            "closing": self._closing,
+            "auth_failed": self.auth_failed,
+            "auth_error": self._auth_error,
+            "restarting": self._restarting,
+            "trackers": len(self._trackers),
+            **self.stats,
+        }

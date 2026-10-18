@@ -1,4 +1,9 @@
-"""Sensors for the ERA Protect Lock (battery)."""
+"""Sensors for the ERA Protect Lock (battery).
+
+The battery % is the most recent of the lock's own MQTT dp8 report (sent with
+its DP dump whenever it wakes) and the slow LAN-poll fallback, so the sensor is
+created — and useful — with or without a hub IP.
+"""
 from __future__ import annotations
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
@@ -35,8 +40,9 @@ class EraBatterySensor(CoordinatorEntity[EraLockCoordinator], SensorEntity):
 
     @property
     def native_value(self) -> int | None:
-        return (self.coordinator.data or {}).get("battery")
+        return self.coordinator.battery
 
     @property
     def available(self) -> bool:
-        return super().available and (self.coordinator.data or {}).get("battery") is not None
+        # Not tied to the LAN poll's success: an MQTT reading stands on its own.
+        return self.coordinator.battery is not None

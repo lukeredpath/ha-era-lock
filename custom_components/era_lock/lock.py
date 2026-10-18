@@ -9,7 +9,9 @@ and delegates lock/unlock commands to the controller.
 lock's link (the hub reporting the lock offline makes it unavailable), not the
 local LAN poll (unlock rides cloud MQTT).
 
-``lock.lock`` raises: the lock can't be locked remotely (it relocks itself).
+``lock.lock`` raises ServiceValidationError: the lock can't be locked remotely
+(it relocks itself) — a refusal of the request, not an integration fault, so HA
+doesn't log it as an error.
 
 Context linkage: every state row caused by an activity line parents to that
 line's context — rows from ``signal_state`` carry it, and a command's own
@@ -24,7 +26,7 @@ from typing import Any
 
 from homeassistant.components.lock import LockEntity
 from homeassistant.core import Context, HomeAssistant, callback
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -77,6 +79,11 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
             async_dispatcher_connect(
                 self.hass, signal_state(self._entry_id), self._on_state)
         )
+        # Start from the controller's current model: the listener connects
+        # (and may already have reported) before the platforms are set up.
+        controller = self.coordinator.controller
+        if controller is not None:
+            self._apply_payload(controller.snapshot())
 
     @property
     def available(self) -> bool:
@@ -109,6 +116,15 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
         }
 
     # -- state projection -----------------------------------------------------
+    @callback
+    def _apply_payload(self, payload: dict) -> None:
+        self._state = payload.get("state")
+        self._changed_by = payload.get("changed_by")
+        self._inferred = payload.get("inferred", True)
+        self._last_method = payload.get("last_method")
+        self._last_user = payload.get("last_user")
+        self._available = payload.get("available", True)
+
     @callback
     def _on_state(self, payload) -> None:
         if not isinstance(payload, dict):
@@ -143,7 +159,7 @@ class EraLockEntity(CoordinatorEntity[EraLockCoordinator], LockEntity):
         handle-lift). Fail loudly rather than pretend, so automations and voice
         assistants never believe the door was locked. The "Mark as locked"
         button (button.py) is the explicit, honest manual assertion."""
-        raise HomeAssistantError(
+        raise ServiceValidationError(
             translation_domain=DOMAIN, translation_key="lock_not_supported")
 
     async def async_unlock(self, **kwargs: Any) -> None:

@@ -1,7 +1,7 @@
 {
   "domain": "era_lock",
   "name": "ERA Protect Lock",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "config_flow": true,
   "after_dependencies": ["logbook"],
   "documentation": "https://github.com/lukeredpath/ha-era-lock",

@@ -50,9 +50,9 @@ from .const import (
     DEFAULT_AUTO_RELOCK_SECONDS,
     DOMAIN,
 )
+from .eralock.era import EraAuthError
 from .eralock.mqtt import CloudMqttLock, MqttUnlockError
 from .events import LockEvent, signal_event, signal_link, signal_raw, signal_state
-from .wake import POST_CLOSE_SYNC_S
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -73,16 +73,32 @@ DEVICE_DEBOUNCE_S = 2.0  # coalesce dp11 mini-history bursts into one transition
 UNLOCK_COALESCE_S = 2.0
 
 # Door opened while we believe the lock is LOCKED: the door can't be open with the
-# deadbolt thrown, so the state is UNLOCKED at once — but HOW it was unlocked is
-# ambiguous. The lock buffers local actions (fingerprint/card) while asleep, so a
-# credential unlock may still be in flight; only if none turns up is it the
-# internal thumbturn (the one manual path that reports no DP). So the unlock's
-# attribution + discrete event are HELD for DOOR_HOLD_S while the door-triggered
-# wake flushes the buffer. Flushes typically land ~3s after a wake (plus up to
-# UNLOCK_COALESCE_S for a dp61/dp62 pair); 10s gives ~3x headroom for a slow BLE
-# reconnect, and the cost of waiting is only a later activity line — the lock
-# state itself is already correct.
-DOOR_HOLD_S = 10.0
+# deadbolt thrown, so it WAS unlocked — but HOW is ambiguous. The lock buffers
+# local actions (fingerprint/card) while asleep, so a credential unlock may still
+# be in flight; only if none turns up is it the internal thumbturn (the one manual
+# path that reports no DP). So the opening starts a HOLD: the door-triggered wake
+# flushes the buffer, and the hold resolves to ONE unlock — its activity line
+# first, THEN the UNLOCKED state row parented to it (cause before effect). The
+# state is left as it was (LOCKED) while the hold is pending; nothing is written.
+#   - A qualifying credential unlock resolves it early, DOOR_SETTLE_S after the
+#     last flushed event (UNLOCK_COALESCE_S for a bare dp61 echo, giving its
+#     method DP the usual chance to supersede it).
+#   - Otherwise it falls back to the thumbturn after DOOR_HOLD_S. 30s (owner
+#     decision; was 10s): a slow BLE reconnect / missed flush gets a second
+#     chance via the DOOR_HOLD_RESYNC_S re-sync, at the price of the state only
+#     going UNLOCKED 30s after a thumbturn exit.
+DOOR_HOLD_S = 30.0
+# Nothing qualifying this far into a hold: one more forced sync (the first
+# wake's flush may have been missed). Half the window leaves ~15s for its
+# flush (~3s typical) to land.
+DOOR_HOLD_RESYNC_S = 15.0
+# A flush is a burst of frames replayed back-to-back over BLE (one DP per frame,
+# so a card -> relock -> fingerprint history is several frames). The hold
+# resolves this long after the LAST collected event, so a later credential /
+# intervening relock from the same burst is still weighed (see
+# _pick_door_cause). 1s covers BLE-paced replay frames with headroom, while
+# being well inside the 2s UNLOCK_COALESCE_S pairing window.
+DOOR_SETTLE_S = 1.0
 # A credential unlock explains the door opening if its device-time is up to this
 # long BEFORE the open (people unlock, then open). Matches the 60s minimum relock
 # failsafe: beyond that the lock would have auto-relocked (and an intervening
@@ -140,17 +156,30 @@ class _HaUnlock:
 
 
 class _DoorHold:
-    """A door-open-from-locked whose unlock attribution is being held."""
+    """A door-open-from-locked whose unlock (line + state) is being held."""
 
-    __slots__ = ("ctx_id", "open_t", "closed_t", "candidates", "lock_dts", "cancel")
+    __slots__ = ("ctx_id", "open_t", "closed_t", "candidates", "lock_dts", "cancel",
+                 "settle_cancel", "resync_cancel", "infer_t")
 
     def __init__(self, ctx_id: str, open_t: float) -> None:
-        self.ctx_id = ctx_id          # reserved cause ctx (state already parents to it)
+        self.ctx_id = ctx_id          # reserved ctx: the unlock line + UNLOCKED row
         self.open_t = open_t          # wall-clock time the door opened
         self.closed_t: float | None = None  # wall-clock close while held (None = open)
         self.candidates: list[tuple[LockEvent, str | None]] = []
         self.lock_dts: list[float] = []  # device locks seen in the lookback
-        self.cancel = None
+        self.cancel = None            # DOOR_HOLD_S deadline (thumbturn fallback)
+        self.settle_cancel = None     # early resolution after a credential
+        self.resync_cancel = None     # DOOR_HOLD_RESYNC_S extra sync
+        # The inference cut-off this hold set (the open). A newer inference
+        # (mark-as-locked, ...) supersedes the hold's own state transition.
+        self.infer_t = open_t
+
+    def cancel_timers(self) -> None:
+        for name in ("cancel", "settle_cancel", "resync_cancel"):
+            fn = getattr(self, name)
+            if fn is not None:
+                fn()
+                setattr(self, name, None)
 
     def in_window(self, dt: float) -> bool:
         return (self.open_t - DOOR_LOOKBACK_S) <= dt <= (self.open_t + DOOR_CLOCK_SLACK_S)
@@ -230,9 +259,9 @@ class EraController:
         self._attributable_ctx_id: str | None = None
         self._door_hold: _DoorHold | None = None  # door-open-from-locked hold
         self._ha_unlock: _HaUnlock | None = None  # latest HA unlock (see HA_ECHO_GRACE_S)
-        # A door-open-from-locked RESOLVED as a thumbturn exit while the door is
-        # still open: the close arms the post-close re-sync.
-        self._exit_pending: bool = False
+        # Set when the ERA account rejected the stored credentials: the cloud
+        # link is down until reauth, so the lock entity is unavailable.
+        self._auth_error: str | None = None
         # The hub's view of the lock's link. While offline, actions at the door
         # are neither reported nor buffered, so the state can't be trusted: the
         # lock entity goes unavailable (see _set_online). Assumed online at
@@ -252,6 +281,65 @@ class EraController:
     def online(self) -> bool:
         """The hub's view of the lock's link (True = awake or asleep/nearby)."""
         return self._online
+
+    @property
+    def available(self) -> bool:
+        """The lock entity's availability: the lock is reachable AND our cloud
+        session is valid."""
+        return self._online and self._auth_error is None
+
+    def snapshot(self) -> dict:
+        """The current state model, as a ``signal_state`` payload with no cause
+        (an entity added after a publish starts from it)."""
+        return {
+            "state": self._state,
+            "changed_by": self._changed_by,
+            "inferred": self._inferred,
+            "last_method": self._last_method,
+            "last_user": self._last_user,
+            "cause_ctx_id": None,
+            "user_id": None,
+            "available": self.available,
+        }
+
+    def diagnostics(self) -> dict:
+        hold = self._door_hold
+        return {
+            "state": self._state,
+            "changed_by": self._changed_by,
+            "inferred": self._inferred,
+            "online": self._online,
+            "auth_error": self._auth_error,
+            "last_method": self._last_method,
+            "door_hold": None if hold is None else {
+                "open_t": hold.open_t, "closed_t": hold.closed_t,
+                "candidates": [(c[0].method, c[0].dt) for c in hold.candidates],
+                "lock_dts": list(hold.lock_dts)},
+            "relock_armed": self._relock_cancel is not None,
+            "last_device_dt": self._last_device_dt,
+            "infer_t": self._infer_t,
+            "door_opened_t": self._door_opened_t,
+            "last_device_event": None if self._last_device_ev is None else {
+                "type": self._last_device_ev.type,
+                "locked": self._last_device_ev.locked,
+                "method": self._last_device_ev.method,
+                "dt": self._last_device_ev.dt,
+                "fresh": self._last_device_ev.fresh},
+            "last_unlock": None if self._last_unlock is None else {
+                "method": self._last_unlock[0].method,
+                "source": self._last_unlock[0].source,
+                "dt": self._last_unlock[0].dt},
+        }
+
+    @callback
+    def set_auth_failed(self, message: str) -> None:
+        """The ERA account rejected our credentials: the lock entity goes
+        unavailable (no unlocks, no state updates until reauth reloads us)."""
+        if self._auth_error is not None:
+            return
+        self._auth_error = message
+        self._changed_by = "ERA sign-in expired — re-authenticate the integration"
+        self._publish_state(None, None)
 
     # -- options --------------------------------------------------------------
     @property
@@ -290,8 +378,8 @@ class EraController:
         self._cancel_relock()
         self._cancel_device_debounce()
         self._cancel_unlock_echo()
-        if self._door_hold is not None and self._door_hold.cancel is not None:
-            self._door_hold.cancel()
+        if self._door_hold is not None:
+            self._door_hold.cancel_timers()
         self._door_hold = None
 
     # -- transition + outputs -------------------------------------------------
@@ -351,7 +439,7 @@ class EraController:
             "last_user": self._last_user,
             "cause_ctx_id": cause_ctx_id,
             "user_id": user_id,
-            "available": self._online,
+            "available": self.available,
         })
 
     @callback
@@ -618,6 +706,11 @@ class EraController:
             # The lock is evidently talking again (a DP frame), whether or not
             # the hub's presence frame has arrived yet.
             self._set_online(True)
+        if ev.type == "battery":
+            setter = getattr(self.coordinator, "async_set_battery", None)
+            if setter is not None:
+                setter(ev.value)
+            return
         if ev.type in ("state_report", "unlock"):
             self._on_push_state(ev)
         elif ev.type in ("failed_unlock", "tamper"):
@@ -731,9 +824,10 @@ class EraController:
             elif hold is not None and hold.accepts(ev) and not echo_of_emitted:
                 # A (buffered) credential unlock that may explain a held
                 # door-open: collect it; the hold emits ONE unlock on resolution
-                # under its reserved context.
+                # under its reserved context — early, once the flush settles.
                 hold.candidates.append((ev, ev_user))
                 ctx_id = hold.ctx_id
+                self._arm_hold_settle(hold)
             else:
                 # Coalesce the dp61 "remote" echo with its method DP so one
                 # physical unlock yields exactly one discrete event.
@@ -752,6 +846,7 @@ class EraController:
                     hold.lock_dts.append(ev.dt)
                     self._emit_held_unlocks(
                         hold, [c for c in hold.candidates if c[0].dt < ev.dt])
+                    self._arm_hold_settle(hold)  # still mid-burst
             ctx_id = Context().id
             if ev.fresh and accepted:
                 # A LIVE lock that will become the pending state: its line and
@@ -824,11 +919,12 @@ class EraController:
     @callback
     def _on_device_locked(self) -> None:
         """The device's own lock settled as the current state: the failsafe,
-        the post-unlock polls and a pending post-close re-sync are all moot."""
+        the post-unlock polls and the rest of a post-close wake series are all
+        moot."""
         self._cancel_relock()
         if self.coordinator.wake is not None:
             self.coordinator.wake.cancel_polls()
-            self.coordinator.wake.cancel_followup()
+            self.coordinator.wake.cancel_close_wakes()
 
     @callback
     def _apply(self, _now=None) -> None:
@@ -842,6 +938,12 @@ class EraController:
         cause_ctx_id = self._pending_ctx_id  # the discrete event emitted on arrival
         self._pending_ctx_id = None
         new = LOCKED if ev.locked else UNLOCKED
+        if (new == UNLOCKED and self._door_hold is not None
+                and self._state == LOCKED):
+            # A door hold owns this unlock: its resolution writes the line and
+            # THEN the UNLOCKED row (a bare dp11:false from the flush must not
+            # put the effect before its cause).
+            return
         if new == LOCKED:
             if deferred:
                 # The live lock survived the debounce: NOW it happened.
@@ -949,51 +1051,50 @@ class EraController:
         # moving — treating it as a close set HA to "unlocked" on every boot.
         if old is None or old.state not in ("on", "off"):
             return
-        opened_from_locked = new.state == "on" and self._state == LOCKED
-        if self.coordinator.wake is not None:
+        hold = self._door_hold
+        opened_from_locked = (new.state == "on" and self._state == LOCKED
+                              and hold is None)
+        wake = self.coordinator.wake
+        if wake is not None:
             # door change -> fetch lock state. Opening from locked forces the
-            # wake past the battery rate limit: the held attribution below
-            # depends on the buffered flush it triggers.
-            self.coordinator.wake.on_door_change(force=opened_from_locked)
+            # wake past the battery rate limit: the held unlock below depends
+            # on the buffered flush it triggers.
+            wake.on_door_change(force=opened_from_locked)
         if new.state == "on":  # opened -> can't be deadbolt-locked
             # An opening is the strongest evidence there is: unlocked at this
-            # instant. Device reports from (well) before it are history (see
-            # _accepts_for_state), and an armed failsafe can no longer assume
-            # an auto-lock (the lock waits for a handle-lift after an opening).
+            # instant. It is the inference cut-off NOW (even while a hold defers
+            # the state row): device reports from (well) before it are history
+            # (see _accepts_for_state), and an armed failsafe can no longer
+            # assume an auto-lock (the lock waits for a handle-lift after an
+            # opening).
             self._door_opened_t = self._infer_t = time.time()
             self._cancel_relock()
-            if opened_from_locked:
+            if wake is not None:
+                wake.cancel_close_wakes()  # reopened: the next close restarts it
+            if hold is not None:
+                # Reopened before the hold resolved: same hold, door open again.
+                hold.closed_t = None
+                hold.infer_t = self._infer_t
+            elif opened_from_locked:
                 # Unlocked for certain, but HOW is ambiguous: a fingerprint/card
-                # unlock may still be buffered in the lock. Go UNLOCKED now and
-                # hold the attribution for the flush (see DOOR_HOLD_S); the state
-                # change parents to the hold's reserved context, which the
-                # eventual unlock event (credential, else thumbturn) is emitted
-                # under.
-                self._resolve_door_hold()  # settle any earlier hold first
-                # The post-close re-sync is armed only once the hold resolves
-                # as a thumbturn exit (see _resolve_door_hold).
-                self._exit_pending = False
-                self._last_method = None   # unknown until the hold resolves
-                self._last_user = None
-                hold = _DoorHold(Context().id, time.time())
+                # unlock may still be buffered in the lock. HOLD — no state row
+                # yet — until the flush brings the credential (resolve early) or
+                # DOOR_HOLD_S passes (thumbturn); the line comes first, then the
+                # UNLOCKED row parented to it.
+                hold = _DoorHold(Context().id, self._infer_t)
                 hold.cancel = async_call_later(
                     self.hass, DOOR_HOLD_S, self._resolve_door_hold)
+                hold.resync_cancel = async_call_later(
+                    self.hass, DOOR_HOLD_RESYNC_S, self._hold_resync)
                 self._door_hold = hold
-                self._transition(UNLOCKED, "Door opened (syncing with lock)",
-                                 inferred=True, cause_ctx_id=hold.ctx_id)
-                self._attributable_ctx_id = hold.ctx_id
-            else:
-                self._exit_pending = False
-                if self._door_hold is not None:
-                    self._door_hold.closed_t = None  # reopened before resolving
-                if self._state != UNLOCKED:
-                    ev = LockEvent(type="door", dt=time.time(), source="door",
-                                   subtype="open")
-                    self._transition(UNLOCKED, "Door opened", inferred=True,
-                                     cause_event=ev, discrete="door")
+            elif self._state != UNLOCKED:
+                ev = LockEvent(type="door", dt=time.time(), source="door",
+                               subtype="open")
+                self._transition(UNLOCKED, "Door opened", inferred=True,
+                                 cause_event=ev, discrete="door")
         elif new.state == "off":  # closed: closing can't throw the deadbolt, so
             # assume the lock stays unlocked; a genuine handle-lift re-lock
-            # arrives as dp11 on the wake this close triggers. Don't clobber a
+            # arrives as dp11 on the wakes this close triggers. Don't clobber a
             # more specific unlock reason (e.g. thumbturn) already set.
             self._cancel_relock()
             # Only resolve an UNKNOWN state here. Never override LOCKED: the door
@@ -1006,23 +1107,39 @@ class EraController:
                                subtype="close")
                 self._transition(UNLOCKED, "Door closed", inferred=True,
                                  cause_event=ev, discrete="door")
-            if self._door_hold is not None:
-                # Closed before the hold resolved: whether this was an exit
-                # isn't known yet — _resolve_door_hold decides (relative to now).
-                self._door_hold.closed_t = time.time()
-            elif self._exit_pending:
-                self._exit_pending = False
-                self._schedule_exit_resync(time.time())
+            if hold is not None:
+                hold.closed_t = time.time()
+            if (hold is not None or self._state != LOCKED) and wake is not None:
+                # Entry or exit alike: someone may lift the handle in the next
+                # half-minute, which the immediate close wake is too early to
+                # see. A device lock settling cancels the rest of the series.
+                wake.schedule_close_wakes()
 
     @callback
-    def _schedule_exit_resync(self, closed_t: float) -> None:
-        """locked -> thumbturn-open -> close: somebody likely left, and a
-        lock-up tends to happen in the first minute. Re-sync POST_CLOSE_SYNC_S
-        after the close to catch it (the immediate close wake fires too early).
-        Only for a thumbturn EXIT — a credential open is someone coming in."""
-        if self.coordinator.wake is not None:
-            self.coordinator.wake.schedule_followup(
-                max(0.0, closed_t + POST_CLOSE_SYNC_S - time.time()))
+    def _hold_resync(self, _now=None) -> None:
+        hold = self._door_hold
+        if hold is None:
+            return
+        hold.resync_cancel = None
+        if not hold.candidates and self.coordinator.wake is not None:
+            _LOGGER.debug("door hold: nothing flushed yet; re-syncing")
+            self.coordinator.wake.hold_resync()
+
+    @callback
+    def _arm_hold_settle(self, hold: _DoorHold) -> None:
+        """(Re)arm the hold's early resolution once it has a credential that
+        explains the open: DOOR_SETTLE_S after the last flushed event, or
+        UNLOCK_COALESCE_S when the best so far is a bare dp61 echo (its method
+        DP gets the usual chance). The DOOR_HOLD_S deadline still applies."""
+        winner = _pick_door_cause(hold.candidates, hold.lock_dts, hold.open_t)
+        if hold.settle_cancel is not None:
+            hold.settle_cancel()
+            hold.settle_cancel = None
+        if winner is None:
+            return  # nothing qualifies (yet): keep holding
+        delay = UNLOCK_COALESCE_S if winner[0].method == "remote" else DOOR_SETTLE_S
+        hold.settle_cancel = async_call_later(
+            self.hass, delay, self._resolve_door_hold)
 
     def _lock_after_open(self, hold: _DoorHold, ev: LockEvent) -> bool:
         """Is a device lock reported during ``hold`` a lock-up AFTER the open
@@ -1058,23 +1175,23 @@ class EraController:
     @callback
     def _resolve_door_hold(self, _now=None, *, by_lock: bool = False) -> None:
         """Settle a held door-open: emit ONE unlock under the hold's context —
-        the credential unlock that explains it, else the thumbturn. Credential
-        unlocks collected but not chosen (disqualified by an intervening device
-        lock) are genuine earlier unlocks and are emitted as their own events,
-        first.
+        the credential unlock that explains it, else the thumbturn — and THEN
+        move the state to UNLOCKED parented to that line. Credential unlocks
+        collected but not chosen (disqualified by an intervening device lock)
+        are genuine earlier unlocks and are emitted as their own events, first.
+
+        The state transition is skipped when something newer already decided
+        the state during the hold: an HA unlock (already UNLOCKED), a reconnect
+        (UNKNOWN — the outage loses what happened), a "Mark as locked" press
+        (a newer inference), or the lock being offline right now.
 
         ``by_lock``: resolved early by a device lock-up after the open (the
-        caller emits that lock's line next). A thumbturn result otherwise means
-        someone left: arm the post-close re-sync — timed from the close if the
-        door already shut during the hold, else on the coming close. A lock-up
-        already seen makes the re-sync moot."""
+        caller then processes that lock: its line and LOCKED row follow)."""
         hold = self._door_hold
         if hold is None:
             return
         self._door_hold = None
-        if hold.cancel is not None:
-            hold.cancel()
-            hold.cancel = None
+        hold.cancel_timers()
         winner = _pick_door_cause(hold.candidates, hold.lock_dts, hold.open_t)
         self._emit_held_unlocks(
             hold, [c for c in hold.candidates
@@ -1087,13 +1204,16 @@ class EraController:
         _LOGGER.debug("door hold resolved: %s%s", ev.method,
                       " (by lock-up)" if by_lock else "")
         self._emit_event("unlock", ev, cause_ctx_id=hold.ctx_id, user_id=user)
-        self._refine_unlock(hold.ctx_id, ev)
-        self._exit_pending = False
-        if winner is None and not by_lock:
-            if hold.closed_t is not None:
-                self._schedule_exit_resync(hold.closed_t)
-            else:
-                self._exit_pending = True  # door still open: arm on the close
+        if (self._state == LOCKED and self._online
+                and self._infer_t == hold.infer_t):
+            reason, display, uid = self._attribute_unlock(ev)
+            self._last_method = ev.method
+            self._last_user = display
+            self._transition(UNLOCKED, reason, inferred=winner is None,
+                             user_id=uid or user, cause_ctx_id=hold.ctx_id)
+            self._attributable_ctx_id = hold.ctx_id
+        else:
+            self._refine_unlock(hold.ctx_id, ev)
 
     # -- commands (called by the entities, which resolve the caller) ----------
     # Both return the context id of the activity line they emitted, so the
@@ -1185,9 +1305,21 @@ class EraController:
             try:
                 ok = listener.unlock()
             except MqttUnlockError as e:
+                if getattr(listener, "auth_failed", False):
+                    raise HomeAssistantError(f"Unlock failed: {e}") from e
                 _LOGGER.debug("MQTT unlock failed (%s); refreshing the listener's "
                               "Tuya session and retrying", e)
-                listener.refresh_session()
+                try:
+                    listener.refresh_session()
+                except EraAuthError as e2:
+                    # Latched by the listener (reauth is being started).
+                    raise HomeAssistantError(
+                        "Unlock failed: ERA sign-in expired — re-authenticate "
+                        "the integration") from e2
+                except Exception as e2:  # noqa: BLE001 — ERA/Tuya unreachable
+                    raise HomeAssistantError(
+                        f"Unlock failed: could not refresh the ERA session "
+                        f"({type(e2).__name__})") from e2
                 try:
                     ok = listener.unlock()
                 except MqttUnlockError as e2:

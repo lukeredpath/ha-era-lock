@@ -36,11 +36,16 @@ Wi-Fi hub and fronted by ERA's cloud. Installable via [HACS](https://hacs.xyz/).
     handle-lift) it stays **unlocked** until the lock reports; with no door
     sensor the state becomes **unknown** (**"Lock state not confirmed"**);
   - shows a transient **"Unlocking…"** state during the cloud round-trip;
-  - with an optional **door-contact sensor**, open-while-locked ⇒ unlocked at
-    once (the door can't open while deadbolt-locked); it then waits ~10s for the
-    lock's buffered events and credits the fingerprint/card that unlocked it,
-    or infers the manual **thumbturn** if none turns up. It also schedules a
-    re-sync ~1 min after an exit to catch a lock-up done just after the door shut;
+  - with an optional **door-contact sensor**, opening the door while it is
+    locked forces a sync and waits for the lock's buffered events: as soon as
+    the fingerprint/card/app unlock that opened it arrives (typically a few
+    seconds), the activity log credits it and *then* the lock shows unlocked —
+    cause before effect. If nothing turns up within 30s (one extra sync is sent
+    half-way) it was the manual **thumbturn**: *Unlocked (thumbturn)*, then
+    unlocked. (So after a thumbturn exit the lock reads *locked* for up to 30s
+    while the door is open.) After **any** door close while the lock isn't
+    known to be locked, it syncs at +10s, +20s and +30s to catch a handle-lift,
+    stopping as soon as the lock reports locked (or the door reopens);
   - writes **one rich activity-log line per thing that happened** — *Unlocked by
     Luke (fingerprint)*, *Unlocked (fingerprint #2)*, *Unlocked in Home
     Assistant*, *Auto-locked (assumed)*, *Failed fingerprint attempt*, ... — even
@@ -51,7 +56,9 @@ Wi-Fi hub and fronted by ERA's cloud. Installable via [HACS](https://hacs.xyz/).
   unlock/tamper/door/connectivity/state-unconfirmed (`event_type` +
   `method`/`credential_id`/`user`/`label`/`description` attributes) for
   automations.
-- **`sensor`** — battery %.
+- **`sensor`** — battery %, from the lock's own report each time it wakes
+  (cloud MQTT), with a slow (6-hourly) LAN poll as a fallback when a hub IP is
+  configured — so it works without a hub IP too.
 - **`binary_sensor`** — **Connection**: whether the hub reports the lock
   reachable.
 - **`button`** — **Mark as locked**: tell Home Assistant the door is locked
@@ -59,7 +66,39 @@ Wi-Fi hub and fronted by ERA's cloud. Installable via [HACS](https://hacs.xyz/).
   shown as locked (inferred), credited to you ("Marked as locked in Home
   Assistant"), until the lock itself reports otherwise.
 - **`button`** — **Sync**: force the BLE lock to wake and report, flushing any
-  buffered events (use sparingly — waking the lock costs battery).
+  buffered events (use sparingly — waking the lock costs battery). Presses a
+  few seconds apart are merged into one wake.
+
+### Keeping the lock in sync (battery)
+
+The BLE lock buffers what happens at the door while it sleeps and only reports
+when woken, and every wake costs battery. The integration wakes it at moments
+that matter: after Home Assistant starts (state is unknown until the lock
+reports), after an unlock (to catch the auto-lock), on door open/close and the
+short post-close series above, and on an **idle heartbeat** — by default every
+**1 hour with a door-contact sensor** (door events already cover entries and
+exits) or every **15 minutes without one**. Leave the *Idle wake interval*
+option empty to use that default; a value you've saved explicitly is kept
+(installs upgraded from 0.1.2 that saved the settings form have 900s stored —
+clear the field to get the new default).
+
+### Sign-in lifecycle
+
+Setup stores an ERA **refresh token**, never your password. The integration
+renews its cloud session on its own and saves each renewed session, so restarts
+pick up where it left off. If ERA ever rejects the stored sign-in (refresh token
+expired or revoked, password changed), the integration stops retrying, the lock
+entity becomes **unavailable**, and Home Assistant shows a **re-authenticate**
+prompt (Settings → Devices & Services): enter your ERA password and it reconnects.
+Network/ERA outages are not treated as sign-in problems — it keeps retrying with
+back-off. If the cloud can't be reached at startup, setup is retried by Home
+Assistant ("Retrying setup").
+
+### Diagnostics
+
+**Settings → Devices & Services → ERA Protect Lock → ⋮ → Download diagnostics**
+gives the connection / lock-state / wake statistics for bug reports, with every
+key, token, id, IP address and email redacted.
 
 ### Unlock attribution
 
