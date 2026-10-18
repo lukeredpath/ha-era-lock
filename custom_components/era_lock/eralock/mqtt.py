@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import struct
+import threading
 import time
 import zlib
 
@@ -87,12 +88,20 @@ class CloudMqttLock:
     # -- operations -----------------------------------------------------------
     def unlock(self, *, wake: bool = True, online_wait: float = 6.0,
                attempts: int = 3, on_event=None) -> bool:
-        """Perform a remote unlock. Returns True iff the lock echoed dp61=AEkA.
+        """Perform a remote unlock on a fresh, short-lived connection. Returns
+        True iff the lock echoed dp61=AEkA.
+
+        Standalone use only (e.g. the CLI): this opens its own MQTT client with
+        the session's clientId, so it must NOT run while another client with the
+        same clientId (a persistent listener) is connected — the broker allows
+        one connection per clientId and the two would kick each other. A caller
+        that already holds a connection drives :meth:`drive_unlock` over it.
 
         `on_event(topic, json_str)` is called for each decrypted inbound message.
         """
         client, host, port = self._client()
-        state = {"connected": None, "online": False, "unlocked": False}
+        state = {"connected": None}
+        tracker = UnlockTracker(self.cid)
 
         def on_connect(c, u, flags, rc, props):
             state["connected"] = int(rc.value) if hasattr(rc, "value") else int(rc)
@@ -104,17 +113,7 @@ class CloudMqttLock:
             js = self._decrypt(msg.payload)
             if on_event:
                 on_event(msg.topic, js)
-            try:
-                o = json.loads(js)
-            except Exception:
-                return
-            data = o.get("data", {})
-            if o.get("protocol") == 25 and self.cid in (data.get("online") or []):
-                state["online"] = True
-            if isinstance(data, dict) and data.get("cid") == self.cid and isinstance(data.get("dps"), dict):
-                state["online"] = True
-                if data["dps"].get(UNLOCK_ECHO[0]) == UNLOCK_ECHO[1]:
-                    state["unlocked"] = True
+            tracker.feed(js)
 
         client.on_connect, client.on_message = on_connect, on_message
         client.connect(host, port, keepalive=self.mq.get("keepAlive", 60))
@@ -127,23 +126,36 @@ class CloudMqttLock:
                 raise MqttUnlockError(
                     f"MQTT auth failed (rc={state['connected']}). "
                     "Session creds likely expired — re-capture mqtt_secrets.json.")
-            if wake:
-                self._publish(client, WAKE_DPS)
-                t0 = time.time()
-                while time.time() - t0 < online_wait and not state["online"]:
-                    time.sleep(0.1)
-            for _ in range(attempts):
-                self._publish(client, UNLOCK_DPS)
-                t0 = time.time()
-                while time.time() - t0 < 4 and not state["unlocked"]:
-                    time.sleep(0.1)
-                if state["unlocked"]:
-                    break
-            time.sleep(1.5)  # flush trailing reports
-            return state["unlocked"]
+            return self.drive_unlock(lambda dps: self._publish(client, dps), tracker,
+                                     wake=wake, online_wait=online_wait,
+                                     attempts=attempts)
         finally:
             client.loop_stop()
             client.disconnect()
+
+    def drive_unlock(self, publish, tracker: "UnlockTracker", *, wake: bool = True,
+                     online_wait: float = 6.0, attempts: int = 3,
+                     echo_wait: float = 4.0, settle: float = 1.5) -> bool:
+        """The unlock protocol, over any already-connected, subscribed client.
+
+        `publish(dps)` sends one command frame (e.g. ``self._publish(client, dps)``);
+        `tracker` must be fed every decrypted inbound frame by the caller's
+        message handler (any thread). Sequence: wake (dp54) and wait up to
+        `online_wait` for the lock to report; then up to `attempts` x unlock
+        (dp61) each waiting `echo_wait` for the dp61=AEkA echo; then `settle`
+        (lets a short-lived connection flush trailing reports — a persistent
+        connection passes 0). Returns True iff the echo was seen.
+        """
+        if wake:
+            publish(WAKE_DPS)
+            tracker.wait("online", online_wait)
+        for _ in range(attempts):
+            publish(UNLOCK_DPS)
+            if tracker.wait("unlocked", echo_wait):
+                break
+        if settle:
+            time.sleep(settle)
+        return tracker.unlocked
 
     def watch(self, seconds: float, on_event) -> None:
         """Passively subscribe and deliver decrypted inbound messages (no publish)."""
@@ -174,7 +186,54 @@ class CloudMqttLock:
             client.disconnect()
 
     def _publish(self, client, dps: dict):
-        client.publish(self.out_topic, self._build_frame(dps), qos=1)
+        return client.publish(self.out_topic, self._build_frame(dps), qos=1)
+
+
+class UnlockTracker:
+    """Unlock progress for one :meth:`CloudMqttLock.drive_unlock` run.
+
+    Thread-safe: :meth:`feed` is called from the MQTT network thread with each
+    decrypted inbound frame (it only observes — the caller still processes the
+    frame as usual); :meth:`wait` blocks the unlocking thread. Only frames fed
+    after construction count, so a fresh tracker per unlock never sees a stale
+    echo.
+    """
+
+    def __init__(self, cid: str):
+        self.cid = cid
+        self.online = False     # lock reported (any dps frame / p25 online list)
+        self.unlocked = False   # dp61=AEkA echo seen
+        self._cond = threading.Condition()
+
+    def feed(self, frame) -> None:
+        """Observe one decrypted frame (JSON str, or an already-parsed dict)."""
+        if not isinstance(frame, dict):
+            try:
+                frame = json.loads(frame)
+            except Exception:
+                return
+            if not isinstance(frame, dict):
+                return
+        data = frame.get("data")
+        if not isinstance(data, dict):
+            return
+        online = unlocked = False
+        listed = data.get("online")
+        if frame.get("protocol") == 25 and isinstance(listed, list) and self.cid in listed:
+            online = True
+        if data.get("cid") == self.cid and isinstance(data.get("dps"), dict):
+            online = True
+            unlocked = data["dps"].get(UNLOCK_ECHO[0]) == UNLOCK_ECHO[1]
+        if online or unlocked:
+            with self._cond:
+                self.online = self.online or online
+                self.unlocked = self.unlocked or unlocked
+                self._cond.notify_all()
+
+    def wait(self, what: str, timeout: float) -> bool:
+        """Block until flag `what` ("online"/"unlocked") is set or `timeout`."""
+        with self._cond:
+            return self._cond.wait_for(lambda: getattr(self, what), timeout)
 
 
 class MqttUnlockError(RuntimeError):

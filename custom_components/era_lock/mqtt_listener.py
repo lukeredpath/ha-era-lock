@@ -7,8 +7,13 @@ inference all live in the controller (Layer 2).
 
 Runs a paho client in its own thread (paho-managed); callbacks bridge back to
 the HA loop with ``call_soon_threadsafe``. On an auth failure (expired session
-creds) it re-mints the Tuya session and reconnects. Read-only: it only
-subscribes, never publishes, so it can never actuate the lock.
+creds) it re-mints the Tuya session and reconnects.
+
+It is the integration's ONLY Tuya MQTT connection. The broker allows one
+connection per clientId (and ours is a fixed config constant), so anything that
+publishes — the wake/synch (:meth:`EraMqttListener.wake`) and the HA remote
+unlock (:meth:`EraMqttListener.unlock`) — rides this client rather than opening
+a second one, which would kick this one off (and be kicked back) in a loop.
 
 NOTE: the exact inbound value encoding for method DPs is refined from real
 captures — every decrypted frame is logged at debug for that purpose.
@@ -18,6 +23,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import threading
 import time
 
 import paho.mqtt.client as mqtt
@@ -25,7 +31,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 from .eralock import dpmap
-from .eralock.mqtt import UNLOCK_ECHO, CloudMqttLock
+from .eralock.mqtt import UNLOCK_ECHO, CloudMqttLock, MqttUnlockError, UnlockTracker
 from .events import LockEvent, signal_raw
 from .session import EraSessionManager
 
@@ -34,6 +40,12 @@ _LOGGER = logging.getLogger(__name__)
 # A DP whose device event-time is within this of the frame time is a LIVE action;
 # older than this it's a buffered history replay (the lock dumps changes on wake).
 FRESH_WINDOW = 25
+
+# How long an unlock waits for the listener to be connected before failing.
+CONNECT_WAIT_S = 10.0
+# A session refresh within this window is reused rather than re-minted (the
+# unlock retry and the paho thread's auth-failure path can both ask for one).
+REFRESH_REUSE_S = 30.0
 
 
 def _alarm_value(raw):
@@ -93,6 +105,14 @@ class EraMqttListener:
         self._client: mqtt.Client | None = None
         self._closing = False
         self._wake_manager = None  # set via set_wake_manager()
+        # Thread-safety: paho callbacks run on paho's network thread; unlock /
+        # wake / refresh_session run on HA executor threads.
+        self._connected = threading.Event()   # CONNACK rc=0 seen, not since dropped
+        self._unlock_lock = threading.Lock()  # one unlock at a time
+        self._trackers: set[UnlockTracker] = set()
+        self._trackers_lock = threading.Lock()
+        self._session_lock = threading.Lock()  # serialises session re-mints
+        self._refreshed_at: float | None = None  # monotonic time of last re-mint
 
     def set_wake_manager(self, wake_manager) -> None:
         self._wake_manager = wake_manager
@@ -118,6 +138,7 @@ class EraMqttListener:
 
     def stop(self) -> None:
         self._closing = True
+        self._connected.clear()
         if self._client is not None:
             self._client.loop_stop()
             self._client.disconnect()
@@ -133,18 +154,110 @@ class EraMqttListener:
         self._helper._publish(self._client, WAKE_DPS)
         _LOGGER.debug("ERA MQTT: sent wake/synch (dp54)")
 
+    @property
+    def connected(self) -> bool:
+        return self._connected.is_set()
+
+    def unlock(self, *, connect_wait: float = CONNECT_WAIT_S, **kw) -> bool:
+        """Remote unlock over THIS connection (blocking: run in an executor).
+
+        Same protocol as :meth:`CloudMqttLock.unlock` (wake dp54 -> online wait
+        -> dp61 x attempts, confirmed by the inbound dp61=AEkA echo) but driven
+        over the listener's own client, so no second same-clientId connection
+        is opened. Confirmation is observed via an :class:`UnlockTracker` the
+        paho thread feeds from ``_on_message``; frames are still dispatched to
+        the controller as usual. ``kw`` passes through to ``drive_unlock``.
+
+        Raises :class:`MqttUnlockError` if the listener isn't connected within
+        `connect_wait` (or drops mid-unlock). Returns False if unconfirmed.
+        """
+        kw.setdefault("settle", 0.0)  # persistent connection: nothing to flush
+        with self._unlock_lock:
+            if self._client is None or self._closing:
+                raise MqttUnlockError("ERA MQTT listener is not running")
+            if not self._connected.wait(connect_wait):
+                raise MqttUnlockError(
+                    f"ERA MQTT listener not connected after {connect_wait:.0f}s")
+            tracker = UnlockTracker(self._helper.cid)
+            infos: list = []
+            with self._trackers_lock:
+                self._trackers.add(tracker)
+            t0 = time.monotonic()
+            try:
+                ok = self._helper.drive_unlock(
+                    lambda dps: self._publish_connected(dps, infos), tracker, **kw)
+            finally:
+                with self._trackers_lock:
+                    self._trackers.discard(tracker)
+                self._drop_unsent(infos)
+            _LOGGER.debug("ERA MQTT unlock %s in %.1fs",
+                          "confirmed" if ok else "NOT confirmed", time.monotonic() - t0)
+            return ok
+
+    def _publish_connected(self, dps: dict, infos: list) -> None:
+        # Never hand paho a frame while disconnected: a QoS-1 publish made then
+        # is queued (rc=NO_CONN) and sent on reconnect — possibly much later.
+        # Harmless for dp54, but an unlock must never be delivered late. The
+        # check races a drop, so every info is recorded for _drop_unsent.
+        if not self._connected.is_set():
+            raise MqttUnlockError("ERA MQTT listener disconnected mid-unlock")
+        info = self._helper._publish(self._client, dps)
+        infos.append(info)
+        rc = getattr(info, "rc", 0)
+        if rc:
+            raise MqttUnlockError(f"ERA MQTT publish failed (rc={rc})")
+
+    def _drop_unsent(self, infos: list) -> None:
+        """Best-effort: discard any of this unlock's QoS-1 frames paho still
+        holds un-acked, so a later reconnect can't replay them (paho resends
+        un-acked QoS>0 messages on reconnect, even with clean_session). Touches
+        paho internals (2.x), hence the guards; the common case — every frame
+        PUBACKed within ms — never gets here."""
+        client = self._client
+        def unacked(info) -> bool:
+            try:
+                return not info.is_published()
+            except Exception:  # noqa: BLE001 — raises when rc != 0 (still queued)
+                return True
+
+        pending = [i for i in infos if hasattr(i, "mid") and unacked(i)]
+        if not pending or client is None:
+            return
+        try:
+            from paho.mqtt.client import mqtt_ms_wait_for_puback
+            with client._out_message_mutex:
+                for info in pending:
+                    msg = client._out_messages.pop(info.mid, None)
+                    if (msg is not None and msg.state == mqtt_ms_wait_for_puback
+                            and client._inflight_messages > 0):
+                        client._inflight_messages -= 1
+            _LOGGER.debug("ERA MQTT: dropped %d un-acked unlock frame(s)", len(pending))
+        except Exception as e:  # noqa: BLE001
+            _LOGGER.warning("ERA MQTT: could not drop un-acked unlock frames: %s", e)
+
+    def refresh_session(self) -> None:
+        """Re-mint the Tuya session and apply its MQTT creds to THIS client
+        (blocking: run in an executor). If the listener is down, paho's own
+        reconnect loop then connects with them; no second client is opened."""
+        with self._session_lock:
+            self._remint()
+            self._apply_creds()
+
     # -- paho callbacks (paho thread) ----------------------------------------
     def _on_connect(self, client, userdata, flags, reason_code, properties) -> None:
         rc = int(reason_code.value) if hasattr(reason_code, "value") else int(reason_code)
         if rc == 0:
             for topic in self._helper.in_topics:
                 client.subscribe(topic, qos=1)
+            self._connected.set()
             _LOGGER.debug("ERA MQTT connected; subscribed to %s", self._helper.in_topics)
         else:
+            self._connected.clear()
             _LOGGER.warning("ERA MQTT auth failed (rc=%s); refreshing session", rc)
             self._refresh_and_reconnect()
 
     def _on_disconnect(self, client, userdata, *args) -> None:
+        self._connected.clear()
         if not self._closing:
             _LOGGER.debug("ERA MQTT disconnected; paho will retry")
 
@@ -159,7 +272,18 @@ class EraMqttListener:
             obj = json.loads(payload)
         except (json.JSONDecodeError, TypeError):
             return
+        self._feed_trackers(obj)
         self._handle(obj)
+
+    def _feed_trackers(self, obj) -> None:
+        """Let any in-flight unlock observe this frame (non-consuming)."""
+        with self._trackers_lock:
+            trackers = list(self._trackers)
+        for tracker in trackers:
+            try:
+                tracker.feed(obj)
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug("ERA MQTT: unlock tracker feed failed", exc_info=True)
 
     # -- parsing + dispatch ---------------------------------------------------
     def _handle(self, obj: dict) -> None:
@@ -294,12 +418,27 @@ class EraMqttListener:
             async_dispatcher_send, self.hass, signal_raw(self.entry_id), event)
 
     # -- recovery -------------------------------------------------------------
+    def _remint(self) -> None:
+        """Re-mint the Tuya session unless one was just minted (caller holds
+        ``_session_lock``)."""
+        now = time.monotonic()
+        if self._refreshed_at is not None and now - self._refreshed_at < REFRESH_REUSE_S:
+            return
+        self.mgr.refresh_tuya_session()
+        self._refreshed_at = time.monotonic()
+
+    def _apply_creds(self) -> None:
+        mq = self.mgr.mqtt_secrets()
+        assert self._client is not None
+        self._client.username_pw_set(mq["username"], mq["password"])
+
     def _refresh_and_reconnect(self) -> None:
+        # paho thread (from _on_connect on an auth failure)
         try:
-            self.mgr.refresh_tuya_session()
-            mq = self.mgr.mqtt_secrets()
+            with self._session_lock:
+                self._remint()
+                self._apply_creds()
             assert self._client is not None
-            self._client.username_pw_set(mq["username"], mq["password"])
             self._client.reconnect()
         except Exception as e:  # noqa: BLE001
             _LOGGER.error("ERA MQTT session refresh failed: %s", e)

@@ -918,13 +918,32 @@ class EraController:
         return ctx_id
 
     def _unlock(self) -> None:
-        mgr = self.coordinator.mgr
-        combined = self.coordinator.combined
-        try:
-            ok = CloudMqttLock(combined, mgr.mqtt_secrets()).unlock()
-        except MqttUnlockError:
-            _LOGGER.debug("MQTT unlock failed; refreshing Tuya session and retrying")
-            mgr.refresh_tuya_session()
-            ok = CloudMqttLock(combined, mgr.mqtt_secrets()).unlock()
+        # Executor thread. The unlock rides the persistent listener's MQTT
+        # connection: the broker allows one connection per clientId (ours is a
+        # fixed constant), so a second, short-lived CloudMqttLock client would
+        # kick the listener off and be kicked back in a loop (~10s of churn and
+        # lost inbound frames per unlock).
+        listener = self.coordinator.listener
+        if listener is None:
+            # No persistent connection (not the case once set up): standalone.
+            mgr = self.coordinator.mgr
+            combined = self.coordinator.combined
+            try:
+                ok = CloudMqttLock(combined, mgr.mqtt_secrets()).unlock()
+            except MqttUnlockError:
+                _LOGGER.debug("MQTT unlock failed; refreshing Tuya session and retrying")
+                mgr.refresh_tuya_session()
+                ok = CloudMqttLock(combined, mgr.mqtt_secrets()).unlock()
+        else:
+            try:
+                ok = listener.unlock()
+            except MqttUnlockError as e:
+                _LOGGER.debug("MQTT unlock failed (%s); refreshing the listener's "
+                              "Tuya session and retrying", e)
+                listener.refresh_session()
+                try:
+                    ok = listener.unlock()
+                except MqttUnlockError as e2:
+                    raise HomeAssistantError(f"Unlock failed: {e2}") from e2
         if not ok:
             raise HomeAssistantError("Unlock command sent but not confirmed by the lock.")
